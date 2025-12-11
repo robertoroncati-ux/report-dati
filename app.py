@@ -3,9 +3,9 @@ import pandas as pd
 from io import BytesIO
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Report Area Ponente", layout="wide")
+st.set_page_config(page_title="Report Fatturato Agente/Città", layout="wide")
 
-st.title("📊 Report Fatturato per Città – Area Ponente")
+st.title("📊 Report Fatturato Agente / Città")
 
 uploaded_file = st.file_uploader("Carica il file Excel clienti", type=["xlsx", "xls"])
 
