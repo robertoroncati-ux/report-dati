@@ -11,19 +11,16 @@ st.title("📊 Report Fatturato Agente / Città")
 uploaded_file = st.file_uploader("Carica il file Excel clienti", type=["xlsx", "xls"])
 
 
-# ------------------ FUNZIONI SUPPORTO ------------------
-
-def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> BytesIO:
-    """Trasforma un DataFrame in un file Excel in memoria."""
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-    buffer.seek(0)
-    return buffer
-
+# ------------------ FUNZIONI DI SUPPORTO ------------------
 
 def full_report_excel(city_summary, city_agent, agent_city, agent_totals) -> BytesIO:
-    """Crea un file Excel con tutti i report in fogli separati."""
+    """
+    Crea un file Excel in memoria con 4 fogli:
+    - Riassunto_città
+    - Città_Agente
+    - Agente_Città_%
+    - Totale_Agente
+    """
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         city_summary.to_excel(writer, index=False, sheet_name="Riassunto_città")
@@ -37,10 +34,10 @@ def full_report_excel(city_summary, city_agent, agent_city, agent_totals) -> Byt
 # ------------------ LOGICA PRINCIPALE ------------------
 
 if uploaded_file is not None:
-    # Legge il file Excel
+    # 1) Leggo il file Excel
     df = pd.read_excel(uploaded_file)
 
-    # Rinomina colonne in modo robusto rispetto al file che usi
+    # 2) Rinomino le colonne come nel tuo file ponente
     rename_map = {}
 
     # Citta -> Città
@@ -58,14 +55,14 @@ if uploaded_file is not None:
     if rename_map:
         df = df.rename(columns=rename_map)
 
-    # Verifica colonne necessarie
+    # Controllo che ci siano le colonne necessarie
     required_cols = ["Città", "Agente", "Cliente", "Fatturato2025"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         st.error(f"Mancano queste colonne nel file Excel: {missing}")
         st.stop()
 
-    # Anteprima
+    # 3) Anteprima dati
     st.subheader("Anteprima dati (prime 20 righe)")
     st.dataframe(df.head(20))
 
@@ -75,19 +72,7 @@ if uploaded_file is not None:
     # CALCOLI BASE
     # ======================
 
-    # Totale per agente
-    agent_totals = (
-        df.groupby("Agente")
-        .agg(
-            Totale_Fatturato_2025=("Fatturato2025", "sum"),
-            Numero_città=("Città", "nunique"),
-            Numero_clienti=("Cliente", "nunique"),
-        )
-        .reset_index()
-        .sort_values("Totale_Fatturato_2025", ascending=False)
-    )
-
-    # Riassunto per città
+    # Totale per città
     city_summary = (
         df.groupby("Città")
         .agg(
@@ -112,7 +97,19 @@ if uploaded_file is not None:
             Numero_clienti=("Cliente", "nunique"),
         )
         .reset_index()
-        .sort_values(by=["Città", "Fatturato_2025"], ascending=[True, False])
+        .sort_values(["Città", "Fatturato_2025"], ascending=[True, False])
+    )
+
+    # Totale per agente (per capire quanto pesa ogni città sull'agente)
+    agent_totals = (
+        df.groupby("Agente")
+        .agg(
+            Totale_Fatturato_2025=("Fatturato2025", "sum"),
+            Numero_città=("Città", "nunique"),
+            Numero_clienti=("Cliente", "nunique"),
+        )
+        .reset_index()
+        .sort_values("Totale_Fatturato_2025", ascending=False)
     )
 
     # Vista agente → città con %
@@ -134,7 +131,7 @@ if uploaded_file is not None:
         agent_city["Fatturato_2025"] / agent_city["Totale_Fatturato_2025"] * 100
     )
     agent_city = agent_city.sort_values(
-        by=["Agente", "Fatturato_2025"], ascending=[True, False]
+        ["Agente", "Fatturato_2025"], ascending=[True, False]
     )
 
     # ======================
@@ -155,52 +152,20 @@ if uploaded_file is not None:
         st.markdown("### Riassunto per città")
         st.dataframe(city_summary)
 
-        excel_cs = df_to_excel_bytes(city_summary, "Riassunto_città")
-        st.download_button(
-            "⬇️ Scarica riassunto città (Excel)",
-            data=excel_cs,
-            file_name="riassunto_città.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
     # -------- TAB 2: CITTÀ → AGENTE --------
     with tab2:
         st.markdown("### Dettaglio città → agente")
         st.dataframe(city_agent)
-
-        excel_ca = df_to_excel_bytes(city_agent, "Città_Agente")
-        st.download_button(
-            "⬇️ Scarica città → agente (Excel)",
-            data=excel_ca,
-            file_name="città_agente.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
 
     # -------- TAB 3: AGENTE → CITTÀ (CON %) --------
     with tab3:
         st.markdown("### Vista agente → città (con % sul totale agente)")
         st.dataframe(agent_city)
 
-        excel_ac = df_to_excel_bytes(agent_city, "Agente_Città_%")
-        st.download_button(
-            "⬇️ Scarica agente → città (Excel)",
-            data=excel_ac,
-            file_name="agente_città_percentuale.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
     # -------- TAB 4: TOTALE AGENTI + GRAFICO --------
     with tab4:
         st.markdown("### Totale fatturato per agente")
         st.dataframe(agent_totals)
-
-        excel_at = df_to_excel_bytes(agent_totals, "Totale_Agente")
-        st.download_button(
-            "⬇️ Scarica totale per agente (Excel)",
-            data=excel_at,
-            file_name="totale_per_agente.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
 
         st.markdown("---")
         st.markdown("### Dettaglio e grafico per singolo agente")
@@ -232,6 +197,7 @@ if uploaded_file is not None:
 
             if not fatt_per_citta.empty:
                 fig, ax = plt.subplots()
+
                 wedges, texts, autotexts = ax.pie(
                     fatt_per_citta["Fatturato_2025"],
                     labels=fatt_per_citta["Città"],
@@ -240,27 +206,27 @@ if uploaded_file is not None:
                 )
                 ax.axis("equal")
 
-                # Scritte piccole per evitare sovrapposizioni eccessive
+                # Scritte piccole per ridurre le sovrapposizioni
                 for t in texts + autotexts:
                     t.set_fontsize(6)
 
                 st.pyplot(fig)
 
-        st.markdown("---")
-        st.markdown("### 📥 Report completo (tutti i fogli)")
+    st.markdown("---")
+    st.markdown("### 📥 Scarica report completo in Excel")
 
-        excel_full = full_report_excel(
-            city_summary=city_summary,
-            city_agent=city_agent,
-            agent_city=agent_city.rename(
-                columns={"Peso_%_sul_totale_agente": "Peso_%"}
-            ),
-            agent_totals=agent_totals,
-        )
+    excel_full = full_report_excel(
+        city_summary=city_summary,
+        city_agent=city_agent,
+        agent_city=agent_city.rename(
+            columns={"Peso_%_sul_totale_agente": "Peso_%"}
+        ),
+        agent_totals=agent_totals,
+    )
 
-        st.download_button(
-            "⬇️ Scarica report completo (Excel)",
-            data=excel_full,
-            file_name="report_fatturato_completo.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    st.download_button(
+        "⬇️ Scarica report completo (Excel)",
+        data=excel_full,
+        file_name="report_fatturato_completo.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
