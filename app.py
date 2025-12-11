@@ -14,6 +14,7 @@ uploaded_file = st.file_uploader("Carica il file Excel clienti", type=["xlsx", "
 # ------------------ FUNZIONI SUPPORTO ------------------
 
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> BytesIO:
+    """Converte un DataFrame in un file Excel in memoria."""
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -22,6 +23,7 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> BytesIO:
 
 
 def full_report_excel(city_summary, city_agent, agent_city, agent_totals) -> BytesIO:
+    """Crea un unico Excel con tutti i report in fogli separati."""
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         city_summary.to_excel(writer, index=False, sheet_name="Riassunto_città")
@@ -56,50 +58,51 @@ if uploaded_file is not None:
     # Totale per agente
     agent_totals = (
         df.groupby("Agente")
-          .agg(
-              Totale_Fatturato_2025=("Fatturato2025", "sum"),
-              Numero_città=("Città", "nunique"),
-              Numero_clienti=("Cliente", "nunique")
-          )
-          .reset_index()
-          .sort_values("Totale_Fatturato_2025", ascending=False)
+        .agg(
+            Totale_Fatturato_2025=("Fatturato2025", "sum"),
+            Numero_città=("Città", "nunique"),
+            Numero_clienti=("Cliente", "nunique")
+        )
+        .reset_index()
+        .sort_values("Totale_Fatturato_2025", ascending=False)
     )
 
     # Riassunto per città
     city_summary = (
         df.groupby("Città")
-          .agg(
-              Totale_Fatturato_2025=("Fatturato2025", "sum"),
-              Numero_clienti=("Cliente", "nunique"),
-              Numero_agenti=("Agente", "nunique")
-          )
-          .reset_index()
-          .sort_values("Totale_Fatturato_2025", ascending=False)
+        .agg(
+            Totale_Fatturato_2025=("Fatturato2025", "sum"),
+            Numero_clienti=("Cliente", "nunique"),
+            Numero_agenti=("Agente", "nunique")
+        )
+        .reset_index()
+        .sort_values("Totale_Fatturato_2025", ascending=False)
     )
     city_summary["Peso_%"] = (
-        city_summary["Totale_Fatturato_2025"] /
-        city_summary["Totale_Fatturato_2025"].sum() * 100
+        city_summary["Totale_Fatturato_2025"]
+        / city_summary["Totale_Fatturato_2025"].sum()
+        * 100
     )
 
     # Dettaglio città → agente
     city_agent = (
         df.groupby(["Città", "Agente"])
-          .agg(
-              Fatturato_2025=("Fatturato2025", "sum"),
-              Numero_clienti=("Cliente", "nunique")
-          )
-          .reset_index()
-          .sort_values(["Città", "Fatturato_2025"], ascending=[True, False])
+        .agg(
+            Fatturato_2025=("Fatturato2025", "sum"),
+            Numero_clienti=("Cliente", "nunique")
+        )
+        .reset_index()
+        .sort_values(["Città", "Fatturato_2025"], ascending=[True, False])
     )
 
     # Vista agente → città con %
     agent_city_raw = (
         df.groupby(["Agente", "Città"])
-          .agg(
-              Fatturato_2025=("Fatturato2025", "sum"),
-              Numero_clienti=("Cliente", "nunique")
-          )
-          .reset_index()
+        .agg(
+            Fatturato_2025=("Fatturato2025", "sum"),
+            Numero_clienti=("Cliente", "nunique")
+        )
+        .reset_index()
     )
 
     agent_city = agent_city_raw.merge(
@@ -115,7 +118,7 @@ if uploaded_file is not None:
         ["Agente", "Fatturato_2025"], ascending=[True, False]
     )
 
-    # ------------------ TABS COME PRIMA ------------------
+    # ------------------ TABS ------------------
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "📍 Riassunto per città",
@@ -128,12 +131,12 @@ if uploaded_file is not None:
     with tab1:
         st.markdown("### Riassunto per città")
 
-        # Filtro stile Excel
         lista_citta = sorted(city_summary["Città"].unique())
         filtro_citta = st.multiselect(
             "Filtra città (lascia vuoto per tutte)",
             options=lista_citta,
-            default=[]
+            default=[],
+            key="filtro_citta_tab1"
         )
 
         if filtro_citta:
@@ -161,11 +164,17 @@ if uploaded_file is not None:
         col_f1, col_f2 = st.columns(2)
         with col_f1:
             filtro_citta2 = st.multiselect(
-                "Filtra città", options=lista_citta2, default=[]
+                "Filtra città",
+                options=lista_citta2,
+                default=[],
+                key="filtro_citta_tab2"
             )
         with col_f2:
             filtro_agenti2 = st.multiselect(
-                "Filtra agenti", options=lista_agenti2, default=[]
+                "Filtra agenti",
+                options=lista_agenti2,
+                default=[],
+                key="filtro_agenti_tab2"
             )
 
         ca_view = city_agent.copy()
@@ -190,7 +199,10 @@ if uploaded_file is not None:
 
         lista_agenti3 = sorted(agent_city["Agente"].unique())
         filtro_agenti3 = st.multiselect(
-            "Filtra agenti", options=lista_agenti3, default=[]
+            "Filtra agenti",
+            options=lista_agenti3,
+            default=[],
+            key="filtro_agenti_tab3"
         )
 
         ac_view = agent_city.copy()
@@ -210,9 +222,22 @@ if uploaded_file is not None:
     # ---------- TAB 4: TOTALE AGENTI + GRAFICO ----------
     with tab4:
         st.markdown("### Riepilogo totale per agente")
-        st.dataframe(agent_totals)
 
-        buffer4 = df_to_excel_bytes(agent_totals, "Totale_agente")
+        lista_agenti4 = sorted(agent_totals["Agente"].unique())
+        filtro_agenti4 = st.multiselect(
+            "Filtra tabella per agente",
+            options=lista_agenti4,
+            default=[],
+            key="filtro_agenti_tab4"
+        )
+
+        at_view = agent_totals.copy()
+        if filtro_agenti4:
+            at_view = at_view[at_view["Agente"].isin(filtro_agenti4)]
+
+        st.dataframe(at_view)
+
+        buffer4 = df_to_excel_bytes(at_view, "Totale_agente")
         st.download_button(
             "⬇️ Scarica totale per agente (Excel)",
             data=buffer4,
@@ -225,7 +250,8 @@ if uploaded_file is not None:
 
         agente_scelto = st.selectbox(
             "Seleziona un agente",
-            options=sorted(agent_totals["Agente"].unique())
+            options=lista_agenti4,
+            key="selezione_agente_grafico"
         )
 
         df_agente = df[df["Agente"] == agente_scelto].copy()
@@ -246,7 +272,9 @@ if uploaded_file is not None:
             col_t, col_g = st.columns([1, 1])
 
             with col_t:
-                st.write(f"Ripartizione fatturato 2025 per città – **{agente_scelto}**")
+                st.write(
+                    f"Ripartizione fatturato 2025 per città – **{agente_scelto}**"
+                )
                 st.dataframe(fatt_per_citta)
 
             with col_g:
