@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from io import BytesIO
 
-# ------------------ CONFIGURAZIONE BASE ------------------
+# ------------------ CONFIGURAZIONE ------------------
 
 st.set_page_config(page_title="Report Fatturato Agente/Città", layout="wide")
 st.title("📊 Report Fatturato Agente / Città")
@@ -11,10 +11,9 @@ st.title("📊 Report Fatturato Agente / Città")
 uploaded_file = st.file_uploader("Carica il file Excel clienti", type=["xlsx", "xls"])
 
 
-# ------------------ FUNZIONI DI SUPPORTO ------------------
+# ------------------ FUNZIONI SUPPORTO ------------------
 
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> BytesIO:
-    """Trasforma un DataFrame in un file Excel in memoria."""
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -23,10 +22,9 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> BytesIO:
 
 
 def full_report_excel(city_summary, city_agent, agent_city, agent_totals) -> BytesIO:
-    """Crea un unico file Excel con tutti i report in fogli separati."""
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        city_summary.to_excel(writer, index=False, sheet_name="Fatturato_città")
+        city_summary.to_excel(writer, index=False, sheet_name="Riassunto_città")
         city_agent.to_excel(writer, index=False, sheet_name="Città_agente")
         agent_city.to_excel(writer, index=False, sheet_name="Agente_città_%")
         agent_totals.to_excel(writer, index=False, sheet_name="Totale_agente")
@@ -34,316 +32,260 @@ def full_report_excel(city_summary, city_agent, agent_city, agent_totals) -> Byt
     return buffer
 
 
-# ------------------ ELABORAZIONE PRINCIPALE ------------------
+# ------------------ LOGICA PRINCIPALE ------------------
 
 if uploaded_file is not None:
-    # Legge il file Excel
+    # Leggo il file
     df = pd.read_excel(uploaded_file)
 
-    # Uniformiamo i nomi delle colonne (per essere più robusti)
-    if "Citta" in df.columns and "Città" not in df.columns:
-        df = df.rename(columns={"Citta": "Città"})
+    # Adatto i nomi delle colonne al nostro schema
+    df = df.rename(columns={
+        "Citta": "Città",
+        "Agente": "Agente",
+        "Esercizio": "Cliente",
+        "acquistato al 10/12/2025": "Fatturato2025"
+    })
 
-    if "Esercizio" in df.columns and "Cliente" not in df.columns:
-        df = df.rename(columns={"Esercizio": "Cliente"})
-
-    if "acquistato al 10/12/2025" in df.columns and "Fatturato_2025" not in df.columns:
-        df = df.rename(columns={"acquistato al 10/12/2025": "Fatturato_2025"})
-
-    # Colonne di lavoro
-    city_col = "Città"
-    agent_col = "Agente"
-    fatt_col = "Fatturato_2025"
-    client_col = "Cliente" if "Cliente" in df.columns else None
-
-    # Anteprima
     st.subheader("Anteprima dati (prime 20 righe)")
     st.dataframe(df.head(20))
 
     st.markdown("---")
 
-    # ------------------ CALCOLI DI BASE UNA SOLA VOLTA ------------------
+    # ---------- CALCOLI BASE UNA SOLA VOLTA ----------
 
     # Totale per agente
-    agg_dict_agent = {fatt_col: "sum"}
-    if city_col in df.columns:
-        agg_dict_agent["Numero_città"] = (city_col, "nunique")
-    if client_col:
-        agg_dict_agent["Numero_clienti"] = (client_col, "nunique")
-
-    # Pandas non ama i dict misti, quindi faccio due passaggi
     agent_totals = (
-        df.groupby(agent_col)[fatt_col]
-        .sum()
-        .reset_index()
-        .rename(columns={fatt_col: "Totale_Fatturato_2025"})
-        .sort_values("Totale_Fatturato_2025", ascending=False)
+        df.groupby("Agente")
+          .agg(
+              Totale_Fatturato_2025=("Fatturato2025", "sum"),
+              Numero_città=("Città", "nunique"),
+              Numero_clienti=("Cliente", "nunique")
+          )
+          .reset_index()
+          .sort_values("Totale_Fatturato_2025", ascending=False)
     )
-    if city_col in df.columns:
-        agent_cities = (
-            df.groupby(agent_col)[city_col].nunique().reset_index().rename(
-                columns={city_col: "Numero_città"}
-            )
-        )
-        agent_totals = agent_totals.merge(agent_cities, on=agent_col, how="left")
-
-    if client_col:
-        agent_clients = (
-            df.groupby(agent_col)[client_col].nunique().reset_index().rename(
-                columns={client_col: "Numero_clienti"}
-            )
-        )
-        agent_totals = agent_totals.merge(agent_clients, on=agent_col, how="left")
 
     # Riassunto per città
     city_summary = (
-        df.groupby(city_col)[fatt_col]
-        .sum()
-        .reset_index()
-        .rename(columns={fatt_col: "Totale_Fatturato_2025"})
-        .sort_values("Totale_Fatturato_2025", ascending=False)
+        df.groupby("Città")
+          .agg(
+              Totale_Fatturato_2025=("Fatturato2025", "sum"),
+              Numero_clienti=("Cliente", "nunique"),
+              Numero_agenti=("Agente", "nunique")
+          )
+          .reset_index()
+          .sort_values("Totale_Fatturato_2025", ascending=False)
     )
-
-    if client_col:
-        n_clienti = (
-            df.groupby(city_col)[client_col]
-            .nunique()
-            .reset_index()
-            .rename(columns={client_col: "Numero_clienti"})
-        )
-        city_summary = city_summary.merge(n_clienti, on=city_col, how="left")
-
-    n_agenti = (
-        df.groupby(city_col)[agent_col]
-        .nunique()
-        .reset_index()
-        .rename(columns={agent_col: "Numero_agenti"})
-    )
-    city_summary = city_summary.merge(n_agenti, on=city_col, how="left")
-
     city_summary["Peso_%"] = (
-        city_summary["Totale_Fatturato_2025"]
-        / city_summary["Totale_Fatturato_2025"].sum()
-        * 100
+        city_summary["Totale_Fatturato_2025"] /
+        city_summary["Totale_Fatturato_2025"].sum() * 100
     )
 
     # Dettaglio città → agente
     city_agent = (
-        df.groupby([city_col, agent_col])[fatt_col]
-        .sum()
-        .reset_index()
-        .rename(columns={fatt_col: "Fatturato_2025"})
-        .sort_values([city_col, "Fatturato_2025"], ascending=[True, False])
+        df.groupby(["Città", "Agente"])
+          .agg(
+              Fatturato_2025=("Fatturato2025", "sum"),
+              Numero_clienti=("Cliente", "nunique")
+          )
+          .reset_index()
+          .sort_values(["Città", "Fatturato_2025"], ascending=[True, False])
     )
-    if client_col:
-        n_clienti_ca = (
-            df.groupby([city_col, agent_col])[client_col]
-            .nunique()
-            .reset_index()
-            .rename(columns={client_col: "Numero_clienti"})
-        )
-        city_agent = city_agent.merge(
-            n_clienti_ca, on=[city_col, agent_col], how="left"
-        )
 
     # Vista agente → città con %
     agent_city_raw = (
-        df.groupby([agent_col, city_col])[fatt_col]
-        .sum()
-        .reset_index()
-        .rename(columns={fatt_col: "Fatturato_2025"})
+        df.groupby(["Agente", "Città"])
+          .agg(
+              Fatturato_2025=("Fatturato2025", "sum"),
+              Numero_clienti=("Cliente", "nunique")
+          )
+          .reset_index()
     )
-    if client_col:
-        n_clienti_ac = (
-            df.groupby([agent_col, city_col])[client_col]
-            .nunique()
-            .reset_index()
-            .rename(columns={client_col: "Numero_clienti"})
-        )
-        agent_city_raw = agent_city_raw.merge(
-            n_clienti_ac, on=[agent_col, city_col], how="left"
-        )
 
     agent_city = agent_city_raw.merge(
-        agent_totals[[agent_col, "Totale_Fatturato_2025"]],
-        on=agent_col,
-        how="left",
+        agent_totals[["Agente", "Totale_Fatturato_2025"]],
+        on="Agente",
+        how="left"
     )
     agent_city["Peso_%_sul_totale_agente"] = (
-        agent_city["Fatturato_2025"] / agent_city["Totale_Fatturato_2025"] * 100
+        agent_city["Fatturato_2025"] /
+        agent_city["Totale_Fatturato_2025"] * 100
     )
     agent_city = agent_city.sort_values(
-        [agent_col, "Fatturato_2025"], ascending=[True, False]
+        ["Agente", "Fatturato_2025"], ascending=[True, False]
     )
 
-    # ------------------ TABS ------------------
+    # ------------------ TABS COME PRIMA ------------------
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        [
-            "📍 Riassunto per città",
-            "🏬 Città → Agente",
-            "🧑‍💼 Agente → Città (con %)",
-            "📈 Totale agenti + grafico",
-        ]
-    )
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📍 Riassunto per città",
+        "🏬 Dettaglio città → agente",
+        "🧑‍💼 Vista agente → città (con %)",
+        "📈 Totale agenti + grafico"
+    ])
 
-    # -------- TAB 1: RIASSUNTO CITTÀ --------
+    # ---------- TAB 1: RIASSUNTO PER CITTÀ ----------
     with tab1:
         st.markdown("### Riassunto per città")
 
-        all_cities = sorted(city_summary[city_col].unique())
-        selected_cities = st.multiselect(
-            "Filtra per città", options=all_cities, default=[]
+        # Filtro stile Excel
+        lista_citta = sorted(city_summary["Città"].unique())
+        filtro_citta = st.multiselect(
+            "Filtra città (lascia vuoto per tutte)",
+            options=lista_citta,
+            default=[]
         )
 
-        if selected_cities:
-            cs_filtered = city_summary[city_summary[city_col].isin(selected_cities)]
+        if filtro_citta:
+            cs_view = city_summary[city_summary["Città"].isin(filtro_citta)]
         else:
-            cs_filtered = city_summary
+            cs_view = city_summary
 
-        st.dataframe(cs_filtered)
+        st.dataframe(cs_view)
 
-        excel_city = df_to_excel_bytes(cs_filtered, "Fatturato_città")
+        buffer1 = df_to_excel_bytes(cs_view, "Riassunto_città")
         st.download_button(
-            "⬇️ Scarica riepilogo città (Excel)",
-            data=excel_city,
-            file_name="riepilogo_città.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "⬇️ Scarica riassunto per città (Excel)",
+            data=buffer1,
+            file_name="riassunto_città.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-    # -------- TAB 2: CITTÀ → AGENTE --------
+    # ---------- TAB 2: DETTAGLIO CITTÀ → AGENTE ----------
     with tab2:
-        st.markdown("### Dettaglio città → agente")
+        st.markdown("### Dettaglio per città e agente")
 
-        all_cities = sorted(city_agent[city_col].unique())
-        all_agents = sorted(city_agent[agent_col].unique())
+        lista_citta2 = sorted(city_agent["Città"].unique())
+        lista_agenti2 = sorted(city_agent["Agente"].unique())
 
         col_f1, col_f2 = st.columns(2)
         with col_f1:
-            sel_cities = st.multiselect(
-                "Filtra per città", options=all_cities, default=[]
+            filtro_citta2 = st.multiselect(
+                "Filtra città", options=lista_citta2, default=[]
             )
         with col_f2:
-            sel_agents = st.multiselect(
-                "Filtra per agente", options=all_agents, default=[]
+            filtro_agenti2 = st.multiselect(
+                "Filtra agenti", options=lista_agenti2, default=[]
             )
 
-        ca_filtered = city_agent.copy()
-        if sel_cities:
-            ca_filtered = ca_filtered[ca_filtered[city_col].isin(sel_cities)]
-        if sel_agents:
-            ca_filtered = ca_filtered[ca_filtered[agent_col].isin(sel_agents)]
+        ca_view = city_agent.copy()
+        if filtro_citta2:
+            ca_view = ca_view[ca_view["Città"].isin(filtro_citta2)]
+        if filtro_agenti2:
+            ca_view = ca_view[ca_view["Agente"].isin(filtro_agenti2)]
 
-        st.dataframe(ca_filtered)
+        st.dataframe(ca_view)
 
-        excel_city_agent = df_to_excel_bytes(ca_filtered, "Città_agente")
+        buffer2 = df_to_excel_bytes(ca_view, "Città_agente")
         st.download_button(
             "⬇️ Scarica città → agente (Excel)",
-            data=excel_city_agent,
+            data=buffer2,
             file_name="città_agente.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-    # -------- TAB 3: AGENTE → CITTÀ CON % --------
+    # ---------- TAB 3: VISTA AGENTE → CITTÀ (CON %) ----------
     with tab3:
-        st.markdown("### Vista agente → città con peso % sul totale agente")
+        st.markdown("### Totale fatturato per agente e città (con peso %)")
 
-        all_agents = sorted(agent_city[agent_col].unique())
-        sel_agents_tab3 = st.multiselect(
-            "Filtra per agente", options=all_agents, default=[]
+        lista_agenti3 = sorted(agent_city["Agente"].unique())
+        filtro_agenti3 = st.multiselect(
+            "Filtra agenti", options=lista_agenti3, default=[]
         )
 
-        ac_filtered = agent_city.copy()
-        if sel_agents_tab3:
-            ac_filtered = ac_filtered[ac_filtered[agent_col].isin(sel_agents_tab3)]
+        ac_view = agent_city.copy()
+        if filtro_agenti3:
+            ac_view = ac_view[ac_view["Agente"].isin(filtro_agenti3)]
 
-        st.dataframe(ac_filtered)
+        st.dataframe(ac_view)
 
-        excel_agent_city = df_to_excel_bytes(ac_filtered, "Agente_città_%")
+        buffer3 = df_to_excel_bytes(ac_view, "Agente_città_%")
         st.download_button(
             "⬇️ Scarica agente → città (Excel)",
-            data=excel_agent_city,
+            data=buffer3,
             file_name="agente_città_percentuale.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-    # -------- TAB 4: TOTALE AGENTE + GRAFICO --------
+    # ---------- TAB 4: TOTALE AGENTI + GRAFICO ----------
     with tab4:
-        st.markdown("### Totale fatturato per agente")
+        st.markdown("### Riepilogo totale per agente")
+        st.dataframe(agent_totals)
 
-        sel_agents_tab4 = st.multiselect(
-            "Filtra tabella per agente",
-            options=sorted(agent_totals[agent_col].unique()),
-            default=[],
+        buffer4 = df_to_excel_bytes(agent_totals, "Totale_agente")
+        st.download_button(
+            "⬇️ Scarica totale per agente (Excel)",
+            data=buffer4,
+            file_name="totale_per_agente.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-        at_filtered = agent_totals.copy()
-        if sel_agents_tab4:
-            at_filtered = at_filtered[at_filtered[agent_col].isin(sel_agents_tab4)]
-
-        st.dataframe(at_filtered)
 
         st.markdown("---")
-        st.markdown("### Dettaglio e grafico per singolo agente")
+        st.markdown("### Grafico fatturato per città (per singolo agente)")
 
         agente_scelto = st.selectbox(
-            "Seleziona agente per il grafico",
-            options=sorted(agent_totals[agent_col].unique()),
+            "Seleziona un agente",
+            options=sorted(agent_totals["Agente"].unique())
         )
 
-        df_agente = agent_city[agent_city[agent_col] == agente_scelto].copy()
+        df_agente = df[df["Agente"] == agente_scelto].copy()
         if df_agente.empty:
             st.warning("Nessun dato per questo agente.")
         else:
-            # Tabella per agente
-            st.markdown(f"#### Dettaglio città per agente **{agente_scelto}**")
-            df_agente = df_agente.rename(
-                columns={"Peso_%_sul_totale_agente": "Peso_%"}
+            fatt_per_citta = (
+                df_agente.groupby("Città")["Fatturato2025"]
+                .sum()
+                .reset_index()
+                .sort_values("Fatturato2025", ascending=False)
             )
-            st.dataframe(df_agente[[city_col, "Fatturato_2025", "Peso_%"]])
+            totale_agente = fatt_per_citta["Fatturato2025"].sum()
+            fatt_per_citta["Peso_%"] = (
+                fatt_per_citta["Fatturato2025"] / totale_agente * 100
+            )
 
-            # Grafico a barre orizzontali con tutte le città
-            st.markdown("#### Grafico fatturato per città (tutte le città visibili)")
+            col_t, col_g = st.columns([1, 1])
 
-            df_plot = df_agente.sort_values("Fatturato_2025", ascending=True)
+            with col_t:
+                st.write(f"Ripartizione fatturato 2025 per città – **{agente_scelto}**")
+                st.dataframe(fatt_per_citta)
 
-            fig, ax = plt.subplots(figsize=(8, 6))
-            ax.barh(df_plot[city_col], df_plot["Fatturato_2025"])
+            with col_g:
+                # Grafico a barre orizzontali (niente tortona)
+                fatt_sorted = fatt_per_citta.sort_values("Fatturato2025", ascending=True)
 
-            ax.set_xlabel("Fatturato 2025")
-            ax.set_ylabel("Città")
-            ax.set_title(f"Fatturato per città – Agente {agente_scelto}")
+                fig, ax = plt.subplots(figsize=(8, 6))
+                ax.barh(fatt_sorted["Città"], fatt_sorted["Fatturato2025"])
+                ax.set_xlabel("Fatturato 2025")
+                ax.set_ylabel("Città")
+                ax.set_title(f"Fatturato per città – Agente {agente_scelto}")
 
-            for i, (val, perc) in enumerate(
-                zip(df_plot["Fatturato_2025"], df_plot["Peso_%"])
-            ):
-                ax.text(
-                    val,
-                    i,
-                    f"{perc:.1f}%",
-                    va="center",
-                    ha="left",
-                    fontsize=8,
-                )
+                for i, (val, perc) in enumerate(
+                    zip(fatt_sorted["Fatturato2025"], fatt_sorted["Peso_%"])
+                ):
+                    ax.text(
+                        val,
+                        i,
+                        f"{perc:.1f}%",
+                        va="center",
+                        ha="left",
+                        fontsize=8
+                    )
 
-            fig.tight_layout()
-            st.pyplot(fig)
+                fig.tight_layout()
+                st.pyplot(fig)
 
         st.markdown("---")
-        st.markdown("### 📥 Scarica report completo (tutti i fogli)")
+        st.markdown("### 📥 Report completo in un unico Excel")
 
-        excel_full = full_report_excel(
+        full_buffer = full_report_excel(
             city_summary=city_summary,
             city_agent=city_agent,
-            agent_city=agent_city.rename(
-                columns={"Peso_%_sul_totale_agente": "Peso_%"}
-            ),
-            agent_totals=agent_totals,
+            agent_city=agent_city,
+            agent_totals=agent_totals
         )
-
         st.download_button(
-            "⬇️ Scarica report completo (Excel)",
-            data=excel_full,
-            file_name="report_fatturato_completo.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "⬇️ Scarica report completo (tutti i fogli)",
+            data=full_buffer,
+            file_name="report_area_completo.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
