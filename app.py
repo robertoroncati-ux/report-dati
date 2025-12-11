@@ -16,6 +16,16 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str):
     buffer.seek(0)
     return buffer
 
+def full_report_excel(city_summary, city_agent, agent_city, agent_totals):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        city_summary.to_excel(writer, index=False, sheet_name="Riassunto_citta")
+        city_agent.to_excel(writer, index=False, sheet_name="Citta_Agente")
+        agent_city.to_excel(writer, index=False, sheet_name="Agente_Citta_%")
+        agent_totals.to_excel(writer, index=False, sheet_name="Totale_Agente")
+    buffer.seek(0)
+    return buffer
+
 if uploaded_file is not None:
     # Legge il file
     df = pd.read_excel(uploaded_file)
@@ -33,18 +43,57 @@ if uploaded_file is not None:
 
     st.markdown("---")
 
-    # Totale per agente (ci servirà in più tab)
+    # ======================
+    # CALCOLI BASE (una sola volta)
+    # ======================
+    # Totale per agente
     agent_totals = df.groupby("Agente").agg(
         Totale_Fatturato_2025=("Fatturato2025", "sum"),
         Numero_città=("Città", "nunique"),
         Numero_clienti=("Cliente", "nunique")
     ).reset_index().sort_values("Totale_Fatturato_2025", ascending=False)
 
+    # Riassunto per città
+    city_summary = df.groupby("Città").agg(
+        Totale_Fatturato_2025=("Fatturato2025", "sum"),
+        Numero_clienti=("Cliente", "nunique"),
+        Numero_agenti=("Agente", "nunique")
+    ).reset_index().sort_values("Totale_Fatturato_2025", ascending=False)
+
+    # Dettaglio città → agente
+    city_agent = df.groupby(["Città", "Agente"]).agg(
+        Fatturato_2025=("Fatturato2025", "sum"),
+        Numero_clienti=("Cliente", "nunique")
+    ).reset_index().sort_values(
+        by=["Città", "Fatturato_2025"], ascending=[True, False]
+    )
+
+    # Vista agente → città con %
+    agent_city_raw = df.groupby(["Agente", "Città"]).agg(
+        Fatturato_2025=("Fatturato2025", "sum"),
+        Numero_clienti=("Cliente", "nunique")
+    ).reset_index()
+
+    agent_city = agent_city_raw.merge(
+        agent_totals[["Agente", "Totale_Fatturato_2025"]],
+        on="Agente",
+        how="left"
+    )
+
+    agent_city["Peso_%_sul_totale_agente"] = (
+        agent_city["Fatturato_2025"] / agent_city["Totale_Fatturato_2025"] * 100
+    )
+
+    agent_city = agent_city.sort_values(
+        by=["Agente", "Fatturato_2025"], ascending=[True, False]
+    )
+
+    # Tabs
     tab1, tab2, tab3, tab4 = st.tabs([
         "📍 Riassunto per città",
         "🏬 Dettaglio città → agente",
         "🧑‍💼 Vista agente → città (con %)",
-        "📈 Riepilogo agente + grafico"
+        "📈 Totale agenti + grafico"
     ])
 
     # ======================
@@ -52,20 +101,9 @@ if uploaded_file is not None:
     # ======================
     with tab1:
         st.markdown("### Riassunto per città")
-
-        city_summary = df.groupby("Città").agg(
-            Totale_Fatturato_2025=("Fatturato2025", "sum"),
-            Numero_clienti=("Cliente", "nunique"),
-            Numero_agenti=("Agente", "nunique")
-        ).reset_index()
-
-        city_summary = city_summary.sort_values(
-            by="Totale_Fatturato_2025", ascending=False
-        )
-
         st.dataframe(city_summary)
 
-        buffer1 = df_to_excel_bytes(city_summary, "Riassunto per città")
+        buffer1 = df_to_excel_bytes(city_summary, "Riassunto_citta")
         st.download_button(
             label="⬇️ Scarica riassunto per città (Excel)",
             data=buffer1,
@@ -79,19 +117,9 @@ if uploaded_file is not None:
     with tab2:
         st.markdown("### Dettaglio per città e agente")
         st.write("Per ogni città e agente: fatturato e numero di locali seguiti da quell’agente in quella città.")
-
-        city_agent = df.groupby(["Città", "Agente"]).agg(
-            Fatturato_2025=("Fatturato2025", "sum"),
-            Numero_clienti=("Cliente", "nunique")
-        ).reset_index()
-
-        city_agent = city_agent.sort_values(
-            by=["Città", "Fatturato_2025"], ascending=[True, False]
-        )
-
         st.dataframe(city_agent)
 
-        buffer2 = df_to_excel_bytes(city_agent, "Città-Agente")
+        buffer2 = df_to_excel_bytes(city_agent, "Citta_Agente")
         st.download_button(
             label="⬇️ Scarica dettaglio città → agente (Excel)",
             data=buffer2,
@@ -104,31 +132,9 @@ if uploaded_file is not None:
     # ======================
     with tab3:
         st.markdown("### Totale fatturato per agente e città (con peso %)")
-
-        agent_city = df.groupby(["Agente", "Città"]).agg(
-            Fatturato_2025=("Fatturato2025", "sum"),
-            Numero_clienti=("Cliente", "nunique")
-        ).reset_index()
-
-        # Aggiunge il totale agente per calcolare il peso %
-        agent_city = agent_city.merge(
-            agent_totals[["Agente", "Totale_Fatturato_2025"]],
-            on="Agente",
-            how="left"
-        )
-
-        agent_city["Peso_%_sul_totale_agente"] = (
-            agent_city["Fatturato_2025"] /
-            agent_city["Totale_Fatturato_2025"] * 100
-        )
-
-        agent_city = agent_city.sort_values(
-            by=["Agente", "Fatturato_2025"], ascending=[True, False]
-        )
-
         st.dataframe(agent_city)
 
-        buffer3 = df_to_excel_bytes(agent_city, "Agente-Città")
+        buffer3 = df_to_excel_bytes(agent_city, "Agente_Citta_%")
         st.download_button(
             label="⬇️ Scarica fatturato agente → città (Excel)",
             data=buffer3,
@@ -137,13 +143,13 @@ if uploaded_file is not None:
         )
 
     # ======================
-    # TAB 4 – RIEPILOGO AGENTE + GRAFICO A TORTA
+    # TAB 4 – TOTALE AGENTI + GRAFICO E EXCEL COMPLETO
     # ======================
     with tab4:
         st.markdown("### Riepilogo totale per agente")
         st.dataframe(agent_totals)
 
-        buffer4 = df_to_excel_bytes(agent_totals, "Totale per agente")
+        buffer4 = df_to_excel_bytes(agent_totals, "Totale_Agente")
         st.download_button(
             label="⬇️ Scarica totale per agente (Excel)",
             data=buffer4,
@@ -165,7 +171,6 @@ if uploaded_file is not None:
         ).reset_index().sort_values("Fatturato_2025", ascending=False)
 
         if not fatt_per_citta.empty:
-            # Calcola anche la % per tabella
             totale_agente = fatt_per_citta["Fatturato_2025"].sum()
             fatt_per_citta["Peso_%"] = fatt_per_citta["Fatturato_2025"] / totale_agente * 100
 
@@ -184,3 +189,14 @@ if uploaded_file is not None:
                 )
                 ax.axis("equal")
                 st.pyplot(fig)
+
+        st.markdown("---")
+        st.markdown("### 📥 Report completo in un unico Excel")
+
+        full_buffer = full_report_excel(city_summary, city_agent, agent_city, agent_totals)
+        st.download_button(
+            label="⬇️ Scarica report completo (tutti i fogli)",
+            data=full_buffer,
+            file_name="report_area_ponente_completo.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
