@@ -1,232 +1,252 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
+import numpy as np
 from io import BytesIO
+import matplotlib.pyplot as plt
 
-# ------------------ CONFIGURAZIONE ------------------
+st.set_page_config(page_title="Report Vendite", layout="wide")
 
-st.set_page_config(page_title="Report Fatturato Agente/Città", layout="wide")
-st.title("📊 Report Fatturato Agente / Città")
+# -----------------------------
+# Utils
+# -----------------------------
+REQUIRED_COLS = [
+    "Città", "Agente", "Esercizio", "Categoria", "Articolo", "Fatturato 2024", "Fatturato 2025"
+]
 
-uploaded_file = st.file_uploader("Carica il file Excel clienti", type=["xlsx", "xls"])
+def _clean_text(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+         .str.replace("\u00a0", " ", regex=False)
+         .str.strip()
+    )
 
+@st.cache_data(show_spinner=False)
+def load_excel(file) -> pd.DataFrame:
+    df = pd.read_excel(file, sheet_name=0)
 
-# ------------------ FUNZIONI DI SUPPORTO ------------------
+    # Normalizzo nomi colonne (tolgo spazi finali/iniziali)
+    df.columns = [str(c).strip() for c in df.columns]
 
-def full_report_excel(city_summary, city_agent, agent_city, agent_totals) -> BytesIO:
-    """
-    Crea un file Excel in memoria con 4 fogli:
-    - Riassunto_città
-    - Città_Agente
-    - Agente_Città_%
-    - Totale_Agente
-    """
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        city_summary.to_excel(writer, index=False, sheet_name="Riassunto_città")
-        city_agent.to_excel(writer, index=False, sheet_name="Città_Agente")
-        agent_city.to_excel(writer, index=False, sheet_name="Agente_Città_%")
-        agent_totals.to_excel(writer, index=False, sheet_name="Totale_Agente")
-    buffer.seek(0)
-    return buffer
-
-
-# ------------------ LOGICA PRINCIPALE ------------------
-
-if uploaded_file is not None:
-    # 1) Leggo il file Excel
-    df = pd.read_excel(uploaded_file)
-
-    # 2) Rinomino le colonne come nel tuo file ponente
-    rename_map = {}
-
-    # Citta -> Città
-    if "Citta" in df.columns and "Città" not in df.columns:
-        rename_map["Citta"] = "Città"
-
-    # Esercizio -> Cliente
-    if "Esercizio" in df.columns and "Cliente" not in df.columns:
-        rename_map["Esercizio"] = "Cliente"
-
-    # acquistato al 10/12/2025 -> Fatturato2025
-    if "acquistato al 10/12/2025" in df.columns and "Fatturato2025" not in df.columns:
-        rename_map["acquistato al 10/12/2025"] = "Fatturato2025"
-
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # Controllo che ci siano le colonne necessarie
-    required_cols = ["Città", "Agente", "Cliente", "Fatturato2025"]
-    missing = [c for c in required_cols if c not in df.columns]
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
-        st.error(f"Mancano queste colonne nel file Excel: {missing}")
-        st.stop()
+        raise ValueError(f"Mancano colonne obbligatorie: {missing}")
 
-    # 3) Anteprima dati
-    st.subheader("Anteprima dati (prime 20 righe)")
-    st.dataframe(df.head(20))
+    # Pulizia testi
+    for c in ["Città", "Agente", "Esercizio", "Categoria", "Articolo"]:
+        df[c] = _clean_text(df[c]).replace({"nan": ""})
 
-    st.markdown("---")
+    # Numerici
+    for c in ["Fatturato 2024", "Fatturato 2025"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
-    # ======================
-    # CALCOLI BASE
-    # ======================
+    # Teniamo solo righe "sensate": almeno un fatturato > 0 o almeno un campo compilato
+    # (se vuoi tenerle tutte, togli questa riga)
+    df = df.copy()
 
-    # Totale per città
-    city_summary = (
-        df.groupby("Città")
+    return df
+
+def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, sdf in sheets.items():
+            # nome foglio max 31 caratteri
+            safe = name[:31]
+            sdf.to_excel(writer, index=False, sheet_name=safe)
+    return output.getvalue()
+
+def euro_fmt(x: float) -> str:
+    # Formattazione rapida stile IT
+    return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def plot_bar(df: pd.DataFrame, x_col: str, y_col: str, title: str, top_n: int = 20):
+    # df già ordinato o no: ordino per y desc e prendo top_n
+    tmp = df[[x_col, y_col]].copy()
+    tmp = tmp.sort_values(by=y_col, ascending=False).head(top_n)
+    fig = plt.figure()
+    plt.bar(tmp[x_col].astype(str), tmp[y_col])
+    plt.xticks(rotation=45, ha="right")
+    plt.title(title)
+    plt.tight_layout()
+    st.pyplot(fig, clear_figure=True)
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("Report Vendite (Excel)")
+
+uploaded = st.file_uploader("Carica il file Excel", type=["xlsx", "xls"])
+
+if not uploaded:
+    st.info("Carica un Excel per iniziare.")
+    st.stop()
+
+try:
+    df = load_excel(uploaded)
+except Exception as e:
+    st.error(f"Errore nel caricamento: {e}")
+    st.stop()
+
+# Rename “Esercizio” in UI (solo visuale)
+df_ui = df.rename(columns={"Esercizio": "Cliente"})
+
+# -----------------------------
+# REPORT BASE (parte 1)
+# -----------------------------
+# Città
+report_city = (
+    df_ui.groupby("Città", as_index=False)[["Fatturato 2024", "Fatturato 2025"]]
+        .sum()
+)
+report_city["Delta"] = report_city["Fatturato 2025"] - report_city["Fatturato 2024"]
+report_city = report_city.sort_values("Fatturato 2025", ascending=False)
+
+# Agente
+report_agent = (
+    df_ui.groupby("Agente", as_index=False)[["Fatturato 2024", "Fatturato 2025"]]
+        .sum()
+)
+report_agent["Delta"] = report_agent["Fatturato 2025"] - report_agent["Fatturato 2024"]
+report_agent = report_agent.sort_values("Fatturato 2025", ascending=False)
+
+# -----------------------------
+# NUOVI REPORT
+# -----------------------------
+
+# 1) Agente x Categoria
+agent_category = (
+    df_ui.groupby(["Agente", "Categoria"], as_index=False)[["Fatturato 2024", "Fatturato 2025"]]
+        .sum()
+)
+agent_category["Delta"] = agent_category["Fatturato 2025"] - agent_category["Fatturato 2024"]
+agent_category = agent_category.sort_values(["Agente", "Fatturato 2025"], ascending=[True, False])
+
+# 2) Agente x Prodotto (Articolo)
+agent_product = (
+    df_ui.groupby(["Agente", "Articolo"], as_index=False)[["Fatturato 2024", "Fatturato 2025"]]
+        .sum()
+)
+agent_product["Delta"] = agent_product["Fatturato 2025"] - agent_product["Fatturato 2024"]
+agent_product = agent_product.sort_values(["Agente", "Fatturato 2025"], ascending=[True, False])
+
+# 3) Top prodotti per fatturato per agente (top 10)
+top_products_per_agent = (
+    agent_product.sort_values(["Agente", "Fatturato 2025"], ascending=[True, False])
+                .groupby("Agente", as_index=False)
+                .head(10)
+)
+
+# 4) Confronto 2024 vs 2025 per agente + clienti persi/acquisiti
+# Prima aggrego a livello Agente-Cliente
+agent_client = (
+    df_ui.groupby(["Agente", "Cliente"], as_index=False)[["Fatturato 2024", "Fatturato 2025"]]
+        .sum()
+)
+
+agent_client["attivo_2024"] = agent_client["Fatturato 2024"] > 0
+agent_client["attivo_2025"] = agent_client["Fatturato 2025"] > 0
+
+# Classificazione clienti
+agent_client["stato_cliente"] = np.select(
+    [
+        agent_client["attivo_2024"] & agent_client["attivo_2025"],
+        agent_client["attivo_2024"] & ~agent_client["attivo_2025"],
+        ~agent_client["attivo_2024"] & agent_client["attivo_2025"],
+    ],
+    ["Mantenuto", "Perso", "Acquisito"],
+    default="Inattivo"
+)
+
+# KPI per agente
+agent_kpi = (
+    agent_client.groupby("Agente", as_index=False)
         .agg(
-            Totale_Fatturato_2025=("Fatturato2025", "sum"),
-            Numero_clienti=("Cliente", "nunique"),
-            Numero_agenti=("Agente", "nunique"),
+            fatt_2024=("Fatturato 2024", "sum"),
+            fatt_2025=("Fatturato 2025", "sum"),
+            clienti_2024=("attivo_2024", "sum"),
+            clienti_2025=("attivo_2025", "sum"),
+            clienti_persi=("stato_cliente", lambda s: (s == "Perso").sum()),
+            clienti_acquisiti=("stato_cliente", lambda s: (s == "Acquisito").sum()),
+            clienti_mantenuti=("stato_cliente", lambda s: (s == "Mantenuto").sum()),
         )
-        .reset_index()
-        .sort_values("Totale_Fatturato_2025", ascending=False)
-    )
-    city_summary["Peso_%"] = (
-        city_summary["Totale_Fatturato_2025"]
-        / city_summary["Totale_Fatturato_2025"].sum()
-        * 100
-    )
+)
+agent_kpi["delta"] = agent_kpi["fatt_2025"] - agent_kpi["fatt_2024"]
+agent_kpi = agent_kpi.sort_values("fatt_2025", ascending=False)
 
-    # Dettaglio città → agente
-    city_agent = (
-        df.groupby(["Città", "Agente"])
-        .agg(
-            Fatturato_2025=("Fatturato2025", "sum"),
-            Numero_clienti=("Cliente", "nunique"),
-        )
-        .reset_index()
-        .sort_values(["Città", "Fatturato_2025"], ascending=[True, False])
-    )
+# -----------------------------
+# TABS UI
+# -----------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Base: Città / Agente",
+    "Agente x Categoria",
+    "Agente x Prodotto",
+    "Top prodotti per agente",
+    "Confronto + Clienti persi/acquisiti"
+])
 
-    # Totale per agente (per capire quanto pesa ogni città sull'agente)
-    agent_totals = (
-        df.groupby("Agente")
-        .agg(
-            Totale_Fatturato_2025=("Fatturato2025", "sum"),
-            Numero_città=("Città", "nunique"),
-            Numero_clienti=("Cliente", "nunique"),
-        )
-        .reset_index()
-        .sort_values("Totale_Fatturato_2025", ascending=False)
-    )
+with tab1:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Fatturato per Città")
+        st.dataframe(report_city, use_container_width=True, height=520)
+        plot_bar(report_city, "Città", "Fatturato 2025", "Top città per fatturato 2025", top_n=20)
 
-    # Vista agente → città con %
-    agent_city_raw = (
-        df.groupby(["Agente", "Città"])
-        .agg(
-            Fatturato_2025=("Fatturato2025", "sum"),
-            Numero_clienti=("Cliente", "nunique"),
-        )
-        .reset_index()
-    )
+    with c2:
+        st.subheader("Fatturato per Agente")
+        st.dataframe(report_agent, use_container_width=True, height=520)
+        plot_bar(report_agent, "Agente", "Fatturato 2025", "Fatturato 2025 per agente", top_n=30)
 
-    agent_city = agent_city_raw.merge(
-        agent_totals[["Agente", "Totale_Fatturato_2025"]],
-        on="Agente",
-        how="left",
-    )
-    agent_city["Peso_%_sul_totale_agente"] = (
-        agent_city["Fatturato_2025"] / agent_city["Totale_Fatturato_2025"] * 100
-    )
-    agent_city = agent_city.sort_values(
-        ["Agente", "Fatturato_2025"], ascending=[True, False]
-    )
+with tab2:
+    st.subheader("Agente per Categoria (somma fatturato)")
+    st.dataframe(agent_category, use_container_width=True, height=650)
 
-    # ======================
-    # TABS
-    # ======================
+    # Piccolo focus: top categorie globali 2025
+    st.markdown("**Top categorie 2025 (globale)**")
+    top_cat = df_ui.groupby("Categoria", as_index=False)["Fatturato 2025"].sum().sort_values("Fatturato 2025", ascending=False)
+    plot_bar(top_cat, "Categoria", "Fatturato 2025", "Top categorie 2025", top_n=20)
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        [
-            "📍 Riassunto per città",
-            "🏬 Città → Agente",
-            "🧑‍💼 Agente → Città (con %)",
-            "📈 Totale agenti + grafico",
-        ]
-    )
+with tab3:
+    st.subheader("Agente per Prodotto (Articolo)")
+    st.dataframe(agent_product, use_container_width=True, height=650)
 
-    # -------- TAB 1: RIASSUNTO PER CITTÀ --------
-    with tab1:
-        st.markdown("### Riassunto per città")
-        st.dataframe(city_summary)
+    st.markdown("**Top prodotti 2025 (globale)**")
+    top_prod = df_ui.groupby("Articolo", as_index=False)["Fatturato 2025"].sum().sort_values("Fatturato 2025", ascending=False)
+    plot_bar(top_prod, "Articolo", "Fatturato 2025", "Top prodotti 2025", top_n=20)
 
-    # -------- TAB 2: CITTÀ → AGENTE --------
-    with tab2:
-        st.markdown("### Dettaglio città → agente")
-        st.dataframe(city_agent)
+with tab4:
+    st.subheader("Top 10 prodotti per agente (per fatturato 2025)")
+    st.dataframe(top_products_per_agent, use_container_width=True, height=650)
 
-    # -------- TAB 3: AGENTE → CITTÀ (CON %) --------
-    with tab3:
-        st.markdown("### Vista agente → città (con % sul totale agente)")
-        st.dataframe(agent_city)
+with tab5:
+    st.subheader("Confronto 2024 vs 2025 per agente + clienti persi/acquisiti")
+    st.dataframe(agent_kpi, use_container_width=True, height=500)
 
-    # -------- TAB 4: TOTALE AGENTI + GRAFICO --------
-    with tab4:
-        st.markdown("### Totale fatturato per agente")
-        st.dataframe(agent_totals)
+    st.markdown("**Dettaglio clienti persi/acquisiti per agente (righe)**")
+    # Mostro solo Persi/Acquisiti/Mantenuti (tolgo Inattivo)
+    detail = agent_client[agent_client["stato_cliente"].isin(["Perso", "Acquisito", "Mantenuto"])].copy()
+    detail = detail.sort_values(["Agente", "stato_cliente", "Fatturato 2025"], ascending=[True, True, False])
+    st.dataframe(detail[["Agente", "Cliente", "Fatturato 2024", "Fatturato 2025", "stato_cliente"]], use_container_width=True, height=650)
 
-        st.markdown("---")
-        st.markdown("### Dettaglio e grafico per singolo agente")
+# -----------------------------
+# EXPORT
+# -----------------------------
+st.divider()
+st.subheader("Esporta report in Excel")
 
-        tutti_agenti = sorted(agent_totals["Agente"].unique())
-        agente_scelto = st.selectbox(
-            "Seleziona agente per il grafico", options=tutti_agenti
-        )
+sheets = {
+    "BASE_CITTA": report_city,
+    "BASE_AGENTE": report_agent,
+    "AGENTE_CATEGORIA": agent_category,
+    "AGENTE_PRODOTTO": agent_product,
+    "TOP_PROD_PER_AGENTE": top_products_per_agent,
+    "AGENTE_KPI": agent_kpi,
+    "DET_CLIENTI": detail[["Agente", "Cliente", "Fatturato 2024", "Fatturato 2025", "stato_cliente"]],
+}
 
-        df_agente = agent_city[agent_city["Agente"] == agente_scelto].copy()
-        if df_agente.empty:
-            st.warning("Nessun dato per questo agente.")
-        else:
-            df_agente = df_agente.rename(
-                columns={"Peso_%_sul_totale_agente": "Peso_%"}
-            )
+excel_bytes = to_excel_bytes(sheets)
 
-            st.markdown(f"#### Dettaglio città per agente **{agente_scelto}**")
-            st.dataframe(df_agente[["Città", "Fatturato_2025", "Peso_%"]])
-
-            st.markdown("#### Grafico fatturato per città (torta)")
-
-            fatt_per_citta = (
-                df_agente.groupby("Città")["Fatturato_2025"]
-                .sum()
-                .reset_index()
-                .sort_values("Fatturato_2025", ascending=False)
-            )
-
-            if not fatt_per_citta.empty:
-                fig, ax = plt.subplots()
-
-                wedges, texts, autotexts = ax.pie(
-                    fatt_per_citta["Fatturato_2025"],
-                    labels=fatt_per_citta["Città"],
-                    autopct="%1.1f%%",
-                    startangle=90,
-                )
-                ax.axis("equal")
-
-                # Scritte piccole per ridurre le sovrapposizioni
-                for t in texts + autotexts:
-                    t.set_fontsize(6)
-
-                st.pyplot(fig)
-
-    st.markdown("---")
-    st.markdown("### 📥 Scarica report completo in Excel")
-
-    excel_full = full_report_excel(
-        city_summary=city_summary,
-        city_agent=city_agent,
-        agent_city=agent_city.rename(
-            columns={"Peso_%_sul_totale_agente": "Peso_%"}
-        ),
-        agent_totals=agent_totals,
-    )
-
-    st.download_button(
-        "⬇️ Scarica report completo (Excel)",
-        data=excel_full,
-        file_name="report_fatturato_completo.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+st.download_button(
+    label="Scarica Excel (tutti i fogli)",
+    data=excel_bytes,
+    file_name="report_vendite.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
