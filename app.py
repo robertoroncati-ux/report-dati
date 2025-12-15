@@ -3,11 +3,14 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 
+# =====================================================
+# CONFIG
+# =====================================================
 st.set_page_config(page_title="Report Vendite (Analisi Città / Agente)", layout="wide")
 
-# =============================
-# Colonne: standard + alias
-# =============================
+# =====================================================
+# COLONNE STANDARD + RINOMINE (robusto)
+# =====================================================
 STD = {
     "city": "Città",
     "agent": "Agente",
@@ -19,35 +22,33 @@ STD = {
 }
 
 RENAME_MAP = {
-    "Città": STD["city"], "Citta": STD["city"], "CITTA": STD["city"],
-    "Agente": STD["agent"], "AGENTE": STD["agent"],
-    "Esercizio": STD["client"], "Cliente": STD["client"], "ESERCIZIO": STD["client"],
-    "Categoria": STD["category"], "CATEGORIA": STD["category"],
-    "Articolo": STD["article"], "ARTICOLO": STD["article"],
-
-    "Fatturato 2024": STD["f24"],
-    "Fatturato2024": STD["f24"],
-    "Fatturato_2024": STD["f24"],
-
-    "Fatturato 2025": STD["f25"],
-    "Fatturato2025": STD["f25"],
-    "Fatturato_2025": STD["f25"],
+    "Citta": "Città",
+    "CITTA": "Città",
+    "AGENTE": "Agente",
+    "Esercizio": "Cliente",
+    "ESERCIZIO": "Cliente",
+    "Fatturato2024": "Fatturato 2024",
+    "Fatturato_2024": "Fatturato 2024",
+    "Fatturato2025": "Fatturato 2025",
+    "Fatturato_2025": "Fatturato 2025",
 }
 
-REQUIRED = [STD["city"], STD["agent"], STD["client"], STD["category"], STD["article"], STD["f24"], STD["f25"]]
+REQUIRED = list(STD.values())
 
-
-def _clean_text(s: pd.Series) -> pd.Series:
+# =====================================================
+# UTILITY
+# =====================================================
+def clean_text(s: pd.Series) -> pd.Series:
     return (
         s.astype(str)
         .str.replace("\u00a0", " ", regex=False)
         .str.strip()
+        .replace({"nan": ""})
     )
 
-
 @st.cache_data(show_spinner=False)
-def load_excel(uploaded_file) -> pd.DataFrame:
-    df = pd.read_excel(uploaded_file, sheet_name=0)
+def load_excel(file) -> pd.DataFrame:
+    df = pd.read_excel(file, sheet_name=0)
     df.columns = [str(c).strip() for c in df.columns]
     df = df.rename(columns=RENAME_MAP)
 
@@ -55,15 +56,15 @@ def load_excel(uploaded_file) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Mancano queste colonne nel file Excel: {missing}")
 
-    # Pulizia testi
-    for c in [STD["city"], STD["agent"], STD["client"], STD["category"], STD["article"]]:
-        df[c] = _clean_text(df[c]).replace({"nan": ""})
+    # pulizia stringhe
+    for c in [STD["agent"], STD["city"], STD["client"], STD["category"], STD["article"]]:
+        df[c] = clean_text(df[c])
 
-    # Numerici
-    for c in [STD["f24"], STD["f25"]]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    # numerici
+    df[STD["f24"]] = pd.to_numeric(df[STD["f24"]], errors="coerce").fillna(0.0)
+    df[STD["f25"]] = pd.to_numeric(df[STD["f25"]], errors="coerce").fillna(0.0)
 
-    # FIX righe fantasma: elimino righe senza chiavi minime (Agente/Città/Cliente)
+    # fix righe fantasma: servono almeno Agente/Città/Cliente
     df = df[
         (df[STD["agent"]] != "") &
         (df[STD["city"]] != "") &
@@ -72,39 +73,12 @@ def load_excel(uploaded_file) -> pd.DataFrame:
 
     return df
 
-
 def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for name, sdf in sheets.items():
             sdf.to_excel(writer, index=False, sheet_name=name[:31])
     return output.getvalue()
-
-
-def add_total_row(df_in: pd.DataFrame, label_map: dict, sum_cols: list, first: bool = True) -> pd.DataFrame:
-    df = df_in.copy()
-    total = {c: np.nan for c in df.columns}
-
-    for k, v in label_map.items():
-        if k in total:
-            total[k] = v
-
-    for c in sum_cols:
-        if c in df.columns:
-            total[c] = df[c].sum()
-
-    total_df = pd.DataFrame([total])
-    if first:
-        return pd.concat([total_df, df], ignore_index=True)
-    return pd.concat([df, total_df], ignore_index=True)
-
-
-def highlight_incidenza(val):
-    try:
-        return "background-color: #ffb3b3" if float(val) > 30 else ""
-    except Exception:
-        return ""
-
 
 def guess_agent(agents: list[str], contains: str) -> str | None:
     contains = contains.lower()
@@ -113,16 +87,32 @@ def guess_agent(agents: list[str], contains: str) -> str | None:
             return a
     return None
 
+def highlight_incidenza(val):
+    try:
+        return "background-color: #ffd1d1" if float(val) >= 30 else ""
+    except Exception:
+        return ""
 
-# =============================
+def add_total_row(df_in: pd.DataFrame, labels: dict, sum_cols: list, first=True) -> pd.DataFrame:
+    df = df_in.copy()
+    total = {c: np.nan for c in df.columns}
+    for k, v in labels.items():
+        if k in total:
+            total[k] = v
+    for c in sum_cols:
+        if c in total:
+            total[c] = df[c].sum()
+    total_df = pd.DataFrame([total])
+    return pd.concat([total_df, df], ignore_index=True) if first else pd.concat([df, total_df], ignore_index=True)
+
+# =====================================================
 # UI
-# =============================
+# =====================================================
 st.title("📊 Report Vendite (Analisi Città / Agente)")
-st.caption("VERSIONE APP: v6 - report + export + simulatore logistico semi-assistito")
+st.caption("VERSIONE APP: v7 — statistiche complete + export per tab + simulatore logistico + auto-proposta per città")
 
 uploaded = st.file_uploader("Carica il file Excel", type=["xlsx", "xls"])
 if not uploaded:
-    st.info("Carica un Excel per iniziare.")
     st.stop()
 
 try:
@@ -133,9 +123,9 @@ except Exception as e:
 
 st.caption(f"Righe totali file (dopo pulizia chiavi): **{len(df):,}**".replace(",", "."))
 
-# =========================================================
-# Base aggregata a livello Agente-Città-Cliente
-# =========================================================
+# =====================================================
+# BASE: aggregazione a livello Agente-Città-Cliente
+# =====================================================
 ac_client_all = (
     df.groupby([STD["agent"], STD["city"], STD["client"]], as_index=False)[[STD["f24"], STD["f25"]]]
       .sum()
@@ -143,25 +133,25 @@ ac_client_all = (
 
 ac_client_active = ac_client_all[ac_client_all[STD["f25"]] > 0].copy()
 
-if ac_client_active.empty:
-    st.warning("Dopo il filtro (Fatturato 2025 > 0) non rimane nessuna riga. Controlla il file.")
-    st.stop()
-
 st.caption(
     f"Clienti aggregati (tutto): **{len(ac_client_all):,}** | "
     f"Clienti attivi 2025 (fatt 2025 > 0): **{len(ac_client_active):,}**"
     .replace(",", ".")
 )
 
-# =============================
-# 1) FATTURATO PER CITTA' - SOLO ATTIVI 2025
-# =============================
+if ac_client_active.empty:
+    st.warning("Dopo il filtro (Fatturato 2025 > 0) non rimane nessuna riga. Controlla il file.")
+    st.stop()
+
+# =====================================================
+# REPORT 1 — FATTURATO PER CITTA' (solo attivi 2025)
+# =====================================================
 city_summary = (
     ac_client_active.groupby(STD["city"], as_index=False)
       .agg(
           fatturato_citta_2025=(STD["f25"], "sum"),
-          n_agenti=(STD["agent"], pd.Series.nunique),
-          n_clienti_attivi=(STD["client"], pd.Series.nunique),
+          clienti_attivi_2025=(STD["client"], "nunique"),
+          agenti_presenti=(STD["agent"], pd.Series.nunique),
       )
       .sort_values("fatturato_citta_2025", ascending=False)
 )
@@ -170,25 +160,29 @@ city_detail = (
     ac_client_active.groupby([STD["city"], STD["agent"]], as_index=False)
       .agg(
           fatturato_agente_nella_citta_2025=(STD["f25"], "sum"),
-          n_clienti_attivi_agente_nella_citta=(STD["client"], pd.Series.nunique),
+          clienti_attivi_agente_nella_citta=(STD["client"], "nunique"),
       )
 )
 
-city_total_map = city_summary.set_index(STD["city"])["fatturato_citta_2025"]
-city_detail["%_incidenza_su_citta"] = (
+city_tot_map = city_summary.set_index(STD["city"])["fatturato_citta_2025"]
+city_detail["% incidenza su città"] = (
     city_detail.apply(
-        lambda r: (r["fatturato_agente_nella_citta_2025"] / city_total_map.get(r[STD["city"]], 1)) * 100,
+        lambda r: (r["fatturato_agente_nella_citta_2025"] / city_tot_map.get(r[STD["city"]], 1)) * 100,
         axis=1
     )
-).round(2)
+).replace([np.inf, -np.inf], np.nan).fillna(0).round(2)
+
 city_detail = city_detail.sort_values([STD["city"], "fatturato_agente_nella_citta_2025"], ascending=[True, False])
 
-# =============================
-# 2) FATTURATO AGENTE - Totali 2024/2025 su TUTTO + flusso clienti + incidenza%
-# =============================
+# =====================================================
+# REPORT 2 — FATTURATO AGENTE (totali 2024/2025 su TUTTO + incidenza + clienti attivi + persi/acquisiti)
+# =====================================================
 agent_totals = (
-    ac_client_all.groupby(STD["agent"], as_index=False)[[STD["f24"], STD["f25"]]]
-      .sum()
+    ac_client_all.groupby(STD["agent"], as_index=False)
+      .agg(
+          fatt_2024=(STD["f24"], "sum"),
+          fatt_2025=(STD["f25"], "sum"),
+      )
 )
 
 agent_active = (
@@ -210,7 +204,7 @@ tmp["stato_cliente"] = np.select(
     default="Inattivo"
 )
 
-agent_client_flow = (
+agent_flow = (
     tmp.groupby(STD["agent"], as_index=False)
       .agg(
           clienti_persi=("stato_cliente", lambda s: (s == "Perso").sum()),
@@ -220,34 +214,25 @@ agent_client_flow = (
 )
 
 agent_report = agent_totals.merge(agent_active, on=STD["agent"], how="left") \
-                          .merge(agent_client_flow, on=STD["agent"], how="left")
+                          .merge(agent_flow, on=STD["agent"], how="left")
 
 agent_report["clienti_attivi_2025"] = agent_report["clienti_attivi_2025"].fillna(0).astype(int)
 for c in ["clienti_persi", "clienti_acquisiti", "clienti_mantenuti"]:
     agent_report[c] = agent_report[c].fillna(0).astype(int)
 
-agent_report = agent_report.rename(columns={
-    STD["f25"]: "Fatturato totale 2025",
-    STD["f24"]: "Fatturato totale 2024",
-})
-
-totale_area_2025 = agent_report["Fatturato totale 2025"].sum()
+tot_area_2025 = agent_report["fatt_2025"].sum()
 agent_report["% incidenza su totale area"] = (
-    agent_report["Fatturato totale 2025"] / totale_area_2025 * 100
-).round(2)
+    agent_report["fatt_2025"] / tot_area_2025 * 100
+).replace([np.inf, -np.inf], np.nan).fillna(0).round(2)
 
-agent_report = agent_report.sort_values("Fatturato totale 2025", ascending=False)
+agent_report = agent_report.sort_values("fatt_2025", ascending=False)
 
-top3 = agent_report.head(3).copy()
-top3_share = (top3["Fatturato totale 2025"].sum() / totale_area_2025 * 100) if totale_area_2025 else 0
-top3_table = top3[[STD["agent"], "Fatturato totale 2025", "% incidenza su totale area"]].copy()
-top3_table = top3_table.rename(columns={STD["agent"]: "Agente"})
+agent_view = agent_report.rename(columns={
+    STD["agent"]: "Agente",
+    "fatt_2024": "Fatturato totale 2024",
+    "fatt_2025": "Fatturato totale 2025",
+}).copy()
 
-agent_client_detail = tmp[tmp["stato_cliente"].isin(["Perso", "Acquisito", "Mantenuto"])][
-    [STD["agent"], STD["city"], STD["client"], STD["f24"], STD["f25"], "stato_cliente"]
-].sort_values([STD["agent"], "stato_cliente", STD["f25"]], ascending=[True, True, False])
-
-agent_view = agent_report.rename(columns={STD["agent"]: "Agente"}).copy()
 agent_view = agent_view[
     [
         "Agente",
@@ -261,9 +246,20 @@ agent_view = agent_view[
     ]
 ]
 
-# =============================
-# 3) FATTURATO PER ZONA (Agente -> Città) + dettaglio cliente - SOLO ATTIVI 2025
-# =============================
+top3 = agent_report.head(3).copy()
+top3_share = (top3["fatt_2025"].sum() / tot_area_2025 * 100) if tot_area_2025 else 0
+top3_table = top3.rename(columns={STD["agent"]: "Agente"})[
+    ["Agente", "fatt_2025", "% incidenza su totale area"]
+].rename(columns={"fatt_2025": "Fatturato totale 2025"})
+
+agent_client_detail = tmp[tmp["stato_cliente"].isin(["Perso", "Acquisito", "Mantenuto"])][
+    [STD["agent"], STD["city"], STD["client"], STD["f24"], STD["f25"], "stato_cliente"]
+].sort_values([STD["agent"], "stato_cliente", STD["f25"]], ascending=[True, True, False])
+
+# =====================================================
+# REPORT 3 — FATTURATO PER ZONA (Agente -> Città) + dettaglio cliente (solo attivi 2025)
+# + Totali con etichette (niente riga 0 "misteriosa")
+# =====================================================
 zone_agent_city = (
     ac_client_active.groupby([STD["agent"], STD["city"]], as_index=False)
       .agg(
@@ -273,40 +269,31 @@ zone_agent_city = (
       .sort_values([STD["agent"], "fatturato_2025"], ascending=[True, False])
 )
 
-zone_agent_city = add_total_row(
-    zone_agent_city,
-    label_map={STD["agent"]: "TOTALE AREA", STD["city"]: "TOTALE"},
-    sum_cols=["fatturato_2025"],
-    first=True
-)
-
 zone_client_detail = (
     ac_client_active.groupby([STD["agent"], STD["city"], STD["client"]], as_index=False)
       .agg(fatturato_cliente_2025=(STD["f25"], "sum"))
       .sort_values([STD["agent"], STD["city"], "fatturato_cliente_2025"], ascending=[True, True, False])
 )
 
-zone_client_detail = add_total_row(
+zone_agent_city_tot = add_total_row(
+    zone_agent_city,
+    labels={STD["agent"]: "TOTALE AREA", STD["city"]: "TOTALE"},
+    sum_cols=["fatturato_2025"],
+    first=True
+)
+
+zone_client_detail_tot = add_total_row(
     zone_client_detail,
-    label_map={STD["agent"]: "TOTALE AREA", STD["city"]: "TOTALE", STD["client"]: "TOTALE"},
+    labels={STD["agent"]: "TOTALE AREA", STD["city"]: "TOTALE", STD["client"]: "TOTALE"},
     sum_cols=["fatturato_cliente_2025"],
     first=True
 )
 
-zone_agent_total = (
-    zone_agent_city[zone_agent_city[STD["agent"]] != "TOTALE AREA"]
-      .groupby(STD["agent"], as_index=False)
-      .agg(
-          fatturato_totale_2025=("fatturato_2025", "sum"),
-          n_citta_attive=(STD["city"], "nunique"),
-          clienti_attivi_totali=("clienti_attivi_2025", "sum"),
-      )
-      .sort_values("fatturato_totale_2025", ascending=False)
-)
+tot_area_zone = zone_agent_city["fatturato_2025"].sum()
 
-# =============================
-# 4) FATTURATO PER CATEGORIA - SOLO ATTIVI 2025 + % incidenza su fatturato agente
-# =============================
+# =====================================================
+# REPORT 4 — FATTURATO PER CATEGORIA (solo attivi 2025) + % incidenza su fatturato agente
+# =====================================================
 df_active_rows = df[df[STD["f25"]] > 0].copy()
 
 agent_total_2025_active = (
@@ -327,9 +314,9 @@ agent_category["% incidenza su fatturato agente"] = (
 agent_category = agent_category.drop(columns=["fatturato_agente_2025"]) \
                                .sort_values([STD["agent"], "fatturato_categoria_2025"], ascending=[True, False])
 
-# =============================
-# TAB UI
-# =============================
+# =====================================================
+# TABS
+# =====================================================
 tab_citta, tab_agente, tab_zona, tab_categoria, tab_sim, tab_export = st.tabs([
     "Fatturato per Città",
     "Fatturato Agente",
@@ -339,7 +326,9 @@ tab_citta, tab_agente, tab_zona, tab_categoria, tab_sim, tab_export = st.tabs([
     "Export Excel (tutto)"
 ])
 
-# -------- TAB CITTÀ --------
+# =====================================================
+# TAB: CITTA'
+# =====================================================
 with tab_citta:
     st.subheader("Fatturato per Città (Sintesi) — SOLO clienti attivi 2025")
     st.dataframe(city_summary, use_container_width=True, height=420)
@@ -358,10 +347,11 @@ with tab_citta:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# -------- TAB AGENTE --------
+# =====================================================
+# TAB: AGENTE
+# =====================================================
 with tab_agente:
     st.subheader("Fatturato Agente — Totali 2024/2025 su TUTTO + % incidenza sul totale area (2025)")
-
     st.markdown(f"**Top 3 agenti = {top3_share:.2f}% del fatturato totale area (2025)**")
     st.dataframe(top3_table, use_container_width=True, height=180)
 
@@ -383,18 +373,20 @@ with tab_agente:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# -------- TAB ZONA --------
+# =====================================================
+# TAB: ZONA
+# =====================================================
 with tab_zona:
     st.subheader("Fatturato per Zona (Agente → Città) — SOLO clienti attivi 2025")
-    st.dataframe(zone_agent_city, use_container_width=True, height=420)
+    st.caption(f"Totale fatturato area (attivi 2025): {tot_area_zone:,.2f}".replace(",", "."))
+    st.dataframe(zone_agent_city_tot, use_container_width=True, height=450)
 
     st.subheader("Dettaglio: Clienti (Agente → Città → Cliente) — SOLO clienti attivi 2025")
-    st.dataframe(zone_client_detail, use_container_width=True, height=520)
+    st.dataframe(zone_client_detail_tot, use_container_width=True, height=520)
 
     zona_xlsx = to_excel_bytes({
-        "ZONA_AGENTE_CITTA": zone_agent_city,
-        "ZONA_CLIENTI_DETT": zone_client_detail,
-        "ZONA_SINTESI_AGENTE": zone_agent_total
+        "ZONA_AGENTE_CITTA": zone_agent_city_tot,
+        "ZONA_CLIENTI_DETT": zone_client_detail_tot
     })
     st.download_button(
         "⬇️ Scarica report Zona (Excel)",
@@ -403,9 +395,11 @@ with tab_zona:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# -------- TAB CATEGORIA --------
+# =====================================================
+# TAB: CATEGORIA
+# =====================================================
 with tab_categoria:
-    st.subheader("Fatturato per Categoria (Agente → Categoria) — SOLO clienti attivi 2025")
+    st.subheader("Fatturato per Categoria (Agente → Categoria) — SOLO attivi 2025 + % incidenza su fatturato agente")
     st.dataframe(agent_category, use_container_width=True, height=650)
 
     cat_xlsx = to_excel_bytes({"CATEGORIA": agent_category})
@@ -416,20 +410,26 @@ with tab_categoria:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# -------- TAB SIMULATORE LOGISTICO --------
+# =====================================================
+# TAB: SIMULATORE + AUTO-PROPOSTA (per città)
+# =====================================================
 with tab_sim:
-    st.subheader("🧠 Simulatore logistico semi-assistito (scenario)")
+    st.header("🧠 Simulatore logistico semi-assistito + ⚡ Auto-proposta per città")
 
-    # BASE simulatore: livello cliente (attivi 2025)
-    base_sim = ac_client_active[[STD["agent"], STD["city"], STD["client"], STD["f25"]]].copy()
-    base_sim = base_sim.rename(columns={STD["f25"]: "fatturato_2025"})
+    # base simulatore: livello cliente (attivi 2025)
+    base_sim = (
+        df.groupby([STD["agent"], STD["city"], STD["client"]], as_index=False)
+          .agg(fatturato_2025=(STD["f25"], "sum"))
+    )
+    base_sim = base_sim[base_sim["fatturato_2025"] > 0].copy()
 
     agents_list = sorted(base_sim[STD["agent"]].unique().tolist())
     cities_list = sorted(base_sim[STD["city"]].unique().tolist())
 
-    # default agent guesses
     default_ron = guess_agent(agents_list, "roncati")
     default_bal = guess_agent(agents_list, "balducci")
+    default_bit = guess_agent(agents_list, "bitto")
+    default_fre = guess_agent(agents_list, "freccero")
 
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1.2])
     with c1:
@@ -437,28 +437,45 @@ with tab_sim:
     with c2:
         bal_out = st.checkbox("Balducci non presente", value=True)
     with c3:
-        include_new = st.checkbox("Inserimento Nuovo Agente", value=True)
+        include_new = st.checkbox("Inserimento nuovo agente", value=True)
     with c4:
         new_agent_name = st.text_input("Nome nuovo agente (simulazione)", value="Nuovo Agente")
 
-    # selezione agenti reali (non obbligatoria, ma utile se i nomi non matchano)
-    st.caption("Se i nomi non coincidono (es. 'A400 - RONCATI...'), selezionali qui:")
-    s1, s2 = st.columns(2)
+    st.caption("Seleziona i nomi esatti (così l’auto-proposta non sbaglia agente).")
+    s1, s2, s3, s4 = st.columns(4)
     with s1:
-        ron_agent = st.selectbox("Seleziona 'Roncati' (per esclusione)", options=["(nessuno)"] + agents_list,
-                                 index=(["(nessuno)"] + agents_list).index(default_ron) if default_ron in agents_list else 0)
+        ron_agent = st.selectbox(
+            "Roncati",
+            options=["(nessuno)"] + agents_list,
+            index=(["(nessuno)"] + agents_list).index(default_ron) if default_ron in agents_list else 0
+        )
     with s2:
-        bal_agent = st.selectbox("Seleziona 'Balducci' (per esclusione)", options=["(nessuno)"] + agents_list,
-                                 index=(["(nessuno)"] + agents_list).index(default_bal) if default_bal in agents_list else 0)
+        bitto_agent = st.selectbox(
+            "Bitto (target)",
+            options=["(nessuno)"] + agents_list,
+            index=(["(nessuno)"] + agents_list).index(default_bit) if default_bit in agents_list else 0
+        )
+    with s3:
+        bal_agent = st.selectbox(
+            "Balducci (uscita)",
+            options=["(nessuno)"] + agents_list,
+            index=(["(nessuno)"] + agents_list).index(default_bal) if default_bal in agents_list else 0
+        )
+    with s4:
+        fre_agent = st.selectbox(
+            "Freccero (preferenza logistica)",
+            options=["(nessuno)"] + agents_list,
+            index=(["(nessuno)"] + agents_list).index(default_fre) if default_fre in agents_list else 0
+        )
 
-    # Applica esclusioni
+    # scenario base (post esclusioni strutturali)
     sim_work = base_sim.copy()
     if ron_out and ron_agent != "(nessuno)":
         sim_work = sim_work[sim_work[STD["agent"]] != ron_agent]
     if bal_out and bal_agent != "(nessuno)":
         sim_work = sim_work[sim_work[STD["agent"]] != bal_agent]
 
-    # Stato PRIMA (dopo eventuali esclusioni strutturali)
+    # Stato PRIMA
     stato_prima = (
         sim_work.groupby(STD["agent"], as_index=False)
           .agg(
@@ -469,11 +486,11 @@ with tab_sim:
           .sort_values("fatturato_prima", ascending=False)
     )
 
-    st.markdown("### Stato PRIMA (dopo esclusioni strutturali)")
-    st.dataframe(stato_prima, use_container_width=True, height=300)
+    st.subheader("Stato PRIMA (dopo esclusioni strutturali)")
+    st.dataframe(stato_prima, use_container_width=True, height=320)
 
-    # ===== Semi-assist: città critiche =====
-    st.markdown("### Suggerimenti (semi-assistito)")
+    # suggerimenti città monoreferente
+    st.subheader("Suggerimenti — città con 1 solo agente (attivi 2025)")
     city_crit = (
         sim_work.groupby(STD["city"], as_index=False)
           .agg(
@@ -482,47 +499,140 @@ with tab_sim:
               agenti=(STD["agent"], "nunique"),
           )
     )
-    # euristica: pochi agenti (1) e fatturato medio per cliente basso => potenziale
     city_crit["fatt_medio_cliente"] = (city_crit["fatturato"] / city_crit["clienti"]).replace([np.inf, -np.inf], 0).fillna(0)
-    city_crit = city_crit.sort_values(["agenti", "fatturato"], ascending=[True, False])
+    st.dataframe(
+        city_crit[city_crit["agenti"] == 1].sort_values("fatturato", ascending=False).head(30),
+        use_container_width=True,
+        height=260
+    )
 
-    st.caption("Città con 1 solo agente (possibili candidate per presidio mirato / nuovo agente):")
-    st.dataframe(city_crit[city_crit["agenti"] == 1].head(20), use_container_width=True, height=260)
-
-    # ===== Movimenti in session state =====
+    # movimenti
     if "moves" not in st.session_state:
         st.session_state["moves"] = pd.DataFrame(columns=[
             "Cliente", "Città", "Da agente", "A agente", "Fatturato", "Motivo"
         ])
 
-    st.markdown("### Aggiunta movimenti (guidata)")
+    def add_move_rows(rows_df: pd.DataFrame, da: str, a: str, motivo: str):
+        if rows_df.empty:
+            return
+        add_rows = rows_df[[STD["client"], STD["city"], "fatturato_2025"]].copy()
+        add_rows = add_rows.rename(columns={
+            STD["client"]: "Cliente",
+            STD["city"]: "Città",
+            "fatturato_2025": "Fatturato"
+        })
+        add_rows["Da agente"] = da
+        add_rows["A agente"] = a
+        add_rows["Motivo"] = motivo
+        st.session_state["moves"] = pd.concat([st.session_state["moves"], add_rows[
+            ["Cliente", "Città", "Da agente", "A agente", "Fatturato", "Motivo"]
+        ]], ignore_index=True)
+
+    def best_receiver_in_city(df_city: pd.DataFrame, prefer_agent: str | None = None) -> str | None:
+        if df_city.empty:
+            return None
+        if prefer_agent and prefer_agent in df_city[STD["agent"]].unique():
+            return prefer_agent
+        g = df_city.groupby(STD["agent"], as_index=False)["fatturato_2025"].sum().sort_values("fatturato_2025", ascending=False)
+        return g.iloc[0][STD["agent"]] if len(g) else None
+
+    st.markdown("---")
+    st.subheader("⚡ Auto-proposta (per città)")
+
+    ap1, ap2, ap3 = st.columns([1.3, 1.2, 1.5])
+    with ap1:
+        ap_city_ron = st.selectbox("Città da cedere (Roncati → Bitto)", options=cities_list, index=0)
+    with ap2:
+        ap_package_target = st.number_input("Pacchetto minimo nuovo agente (€)", min_value=0.0, value=150000.0, step=10000.0)
+    with ap3:
+        ap_focus_cities = st.multiselect(
+            "Città su cui costruire il pacchetto nuovo agente (se vuoto → auto)",
+            options=cities_list
+        )
+
+    b_ap1, b_ap2 = st.columns([1, 1])
+    with b_ap1:
+        if st.button("⚡ Genera Auto-proposta"):
+            # riparto pulito
+            st.session_state["moves"] = st.session_state["moves"].iloc[0:0].copy()
+
+            # 1) Roncati → Bitto nella città scelta
+            if ron_agent != "(nessuno)" and bitto_agent != "(nessuno)":
+                df_ron_city = base_sim[
+                    (base_sim[STD["agent"]] == ron_agent) &
+                    (base_sim[STD["city"]] == ap_city_ron)
+                ].copy()
+                add_move_rows(df_ron_city, ron_agent, bitto_agent, "Auto: Roncati→Bitto per città")
+
+            # 2) Uscita Balducci: redistribuzione PER CITTÀ (preferenza a Freccero se già presente in città)
+            if bal_agent != "(nessuno)":
+                bal_rows = base_sim[base_sim[STD["agent"]] == bal_agent].copy()
+                for city, part in bal_rows.groupby(STD["city"]):
+                    city_pool = base_sim[(base_sim[STD["city"]] == city) & (base_sim[STD["agent"]] != bal_agent)].copy()
+                    receiver = best_receiver_in_city(city_pool, prefer_agent=(fre_agent if fre_agent != "(nessuno)" else None))
+                    if receiver:
+                        add_move_rows(part, bal_agent, receiver, "Auto: uscita Balducci (per città)")
+
+            # 3) Pacchetto nuovo agente: per città
+            if include_new and new_agent_name:
+                city_stats = (
+                    base_sim.groupby(STD["city"], as_index=False)
+                      .agg(fatturato=("fatturato_2025", "sum"), agenti=(STD["agent"], "nunique"))
+                )
+                if len(ap_focus_cities) == 0:
+                    candidate_cities = city_stats[city_stats["agenti"] >= 2].sort_values("fatturato", ascending=False)[STD["city"]].head(6).tolist()
+                else:
+                    candidate_cities = ap_focus_cities
+
+                pool = base_sim[base_sim[STD["city"]].isin(candidate_cities)].copy()
+                pool = pool.sort_values("fatturato_2025", ascending=False)
+
+                tot_pack = 0.0
+                used = set()
+                for _, r in pool.iterrows():
+                    if tot_pack >= ap_package_target:
+                        break
+                    key = (r[STD["agent"]], r[STD["city"]], r[STD["client"]])
+                    if key in used:
+                        continue
+                    used.add(key)
+                    add_move_rows(pd.DataFrame([r]), r[STD["agent"]], new_agent_name, "Auto: pacchetto nuovo agente (per città)")
+                    tot_pack += float(r["fatturato_2025"])
+
+    with b_ap2:
+        if st.button("🧹 Svuota movimenti (auto+manuale)"):
+            st.session_state["moves"] = st.session_state["moves"].iloc[0:0].copy()
+
+    # manuale
+    st.markdown("---")
+    st.subheader("Aggiunta movimenti (manuale)")
 
     g1, g2, g3 = st.columns([1.2, 1.2, 1.2])
     with g1:
-        sel_city = st.selectbox("Città", options=cities_list)
+        sel_city = st.selectbox("Città (manuale)", options=cities_list, key="man_city")
     sub_city = sim_work[sim_work[STD["city"]] == sel_city].copy()
 
     with g2:
-        origin_agent = st.selectbox("Da agente", options=sorted(sub_city[STD["agent"]].unique().tolist()))
+        origin_agent = st.selectbox("Da agente (manuale)", options=sorted(sub_city[STD["agent"]].unique().tolist()), key="man_da")
     sub_origin = sub_city[sub_city[STD["agent"]] == origin_agent].copy()
 
     with g3:
         dest_agents = sorted(sim_work[STD["agent"]].unique().tolist())
-        if include_new:
-            if new_agent_name not in dest_agents:
-                dest_agents = dest_agents + [new_agent_name]
-        dest_agent = st.selectbox("A agente", options=dest_agents)
+        if include_new and new_agent_name and new_agent_name not in dest_agents:
+            dest_agents = dest_agents + [new_agent_name]
+        dest_agent = st.selectbox("A agente (manuale)", options=dest_agents, key="man_a")
 
     clients_options = sub_origin.sort_values("fatturato_2025", ascending=False)[STD["client"]].tolist()
-    sel_clients = st.multiselect("Clienti da spostare (dalla città e agente selezionati)", options=clients_options)
+    sel_clients = st.multiselect("Clienti da spostare (manuale)", options=clients_options, key="man_clients")
+    motivo = st.selectbox("Motivo (manuale)", options=["Logistica", "Riequilibrio", "Nuovo agente"], key="man_motivo")
 
-    motivo = st.selectbox("Motivo", options=["Logistica", "Riequilibrio", "Nuovo agente"])
-
-    b1, b2, b3 = st.columns([1, 1, 2])
+    b1, b2 = st.columns([1, 1])
     with b1:
-        if st.button("➕ Aggiungi movimenti selezionati"):
+        if st.button("➕ Aggiungi movimenti selezionati (manuale)"):
             if sel_clients:
-                add_rows = sub_origin[sub_origin[STD["client"]].isin(sel_clients)][[STD["client"], STD["city"], STD["agent"], "fatturato_2025"]].copy()
+                add_rows = sub_origin[sub_origin[STD["client"]].isin(sel_clients)][
+                    [STD["client"], STD["city"], STD["agent"], "fatturato_2025"]
+                ].copy()
                 add_rows = add_rows.rename(columns={
                     STD["client"]: "Cliente",
                     STD["city"]: "Città",
@@ -531,72 +641,58 @@ with tab_sim:
                 })
                 add_rows["A agente"] = dest_agent
                 add_rows["Motivo"] = motivo
-
                 st.session_state["moves"] = pd.concat([st.session_state["moves"], add_rows[
                     ["Cliente", "Città", "Da agente", "A agente", "Fatturato", "Motivo"]
                 ]], ignore_index=True)
-
     with b2:
-        if st.button("🧹 Svuota movimenti"):
+        if st.button("🧹 Svuota movimenti (manuale)"):
             st.session_state["moves"] = st.session_state["moves"].iloc[0:0].copy()
 
-    with b3:
-        st.caption("Puoi anche modificare manualmente la tabella movimenti qui sotto (semi-assistito + edit libero).")
-
-    st.markdown("### Movimenti (editabili)")
+    st.subheader("Movimenti (editabili)")
     moves_df = st.data_editor(
         st.session_state["moves"],
         num_rows="dynamic",
         use_container_width=True,
         key="moves_editor"
     )
-    # sincronizza eventuali modifiche
     st.session_state["moves"] = moves_df.copy()
 
-    # ===== Applica movimenti =====
+    # applica movimenti
     sim_after = sim_work.copy()
 
-    if len(moves_df) > 0:
-        # Validazioni base
-        moves_ok = moves_df.dropna(subset=["Cliente", "Città", "Da agente", "A agente", "Fatturato"]).copy()
-        moves_ok["Fatturato"] = pd.to_numeric(moves_ok["Fatturato"], errors="coerce").fillna(0.0)
-        moves_ok = moves_ok[moves_ok["Fatturato"] > 0].copy()
+    moves_ok = moves_df.dropna(subset=["Cliente", "Città", "Da agente", "A agente", "Fatturato"]).copy()
+    moves_ok["Fatturato"] = pd.to_numeric(moves_ok["Fatturato"], errors="coerce").fillna(0.0)
+    moves_ok = moves_ok[moves_ok["Fatturato"] > 0].copy()
 
-        for _, r in moves_ok.iterrows():
-            cli = str(r["Cliente"]).strip()
-            cty = str(r["Città"]).strip()
-            da = str(r["Da agente"]).strip()
-            a = str(r["A agente"]).strip()
-            fatt = float(r["Fatturato"])
+    for _, r in moves_ok.iterrows():
+        cli = str(r["Cliente"]).strip()
+        cty = str(r["Città"]).strip()
+        da = str(r["Da agente"]).strip()
+        a = str(r["A agente"]).strip()
+        fatt = float(r["Fatturato"])
 
-            mask = (
-                (sim_after[STD["client"]] == cli) &
-                (sim_after[STD["city"]] == cty) &
-                (sim_after[STD["agent"]] == da)
-            )
+        mask = (
+            (sim_after[STD["client"]] == cli) &
+            (sim_after[STD["city"]] == cty) &
+            (sim_after[STD["agent"]] == da)
+        )
 
-            # quanto esiste davvero da spostare?
-            available = sim_after.loc[mask, "fatturato_2025"].sum()
-            move_amt = min(fatt, available)
+        available = sim_after.loc[mask, "fatturato_2025"].sum()
+        move_amt = min(fatt, available)
+        if move_amt <= 0:
+            continue
 
-            if move_amt <= 0:
-                continue
+        sim_after.loc[mask, "fatturato_2025"] = sim_after.loc[mask, "fatturato_2025"] - move_amt
 
-            # sottraggo
-            sim_after.loc[mask, "fatturato_2025"] = sim_after.loc[mask, "fatturato_2025"] - move_amt
+        sim_after = pd.concat([sim_after, pd.DataFrame([{
+            STD["agent"]: a,
+            STD["city"]: cty,
+            STD["client"]: cli,
+            "fatturato_2025": move_amt
+        }])], ignore_index=True)
 
-            # aggiungo (nuova riga)
-            sim_after = pd.concat([sim_after, pd.DataFrame([{
-                STD["agent"]: a,
-                STD["city"]: cty,
-                STD["client"]: cli,
-                "fatturato_2025": move_amt
-            }])], ignore_index=True)
+    sim_after = sim_after[sim_after["fatturato_2025"] > 0].copy()
 
-        # pulizia: elimino righe diventate 0 o negative
-        sim_after = sim_after[sim_after["fatturato_2025"] > 0].copy()
-
-    # ===== Stato DOPO =====
     stato_dopo = (
         sim_after.groupby(STD["agent"], as_index=False)
           .agg(
@@ -611,7 +707,7 @@ with tab_sim:
     confronto["Delta fatturato"] = confronto["fatturato_dopo"] - confronto["fatturato_prima"]
     confronto = confronto.sort_values("fatturato_dopo", ascending=False)
 
-    st.markdown("### Stato DOPO (dopo movimenti)")
+    st.subheader("Stato DOPO")
     st.dataframe(confronto, use_container_width=True, height=380)
 
     tot_prima = float(stato_prima["fatturato_prima"].sum())
@@ -622,26 +718,18 @@ with tab_sim:
     else:
         st.success(f"✅ Fatturato area invariato: {tot_dopo:,.2f}".replace(",", "."))
 
-    # ===== Pacchetto nuovo agente =====
-    if include_new:
+    if include_new and new_agent_name:
         pac = sim_after[sim_after[STD["agent"]] == new_agent_name].copy()
-        st.markdown("### Pacchetto nuovo agente")
+        st.subheader("Pacchetto nuovo agente")
         if pac.empty:
             st.info("Ancora nessun cliente assegnato al nuovo agente.")
         else:
-            pac_view = pac.groupby([STD["city"]], as_index=False).agg(
+            pac_view = pac.groupby(STD["city"], as_index=False).agg(
                 fatturato=("fatturato_2025", "sum"),
                 clienti=(STD["client"], "nunique")
             ).sort_values("fatturato", ascending=False)
             st.dataframe(pac_view, use_container_width=True, height=260)
 
-            st.info(
-                f"Nuovo agente → Fatturato: {pac['fatturato_2025'].sum():,.2f} | "
-                f"Clienti: {pac[STD['client']].nunique()} | "
-                f"Città: {pac[STD['city']].nunique()}".replace(",", ".")
-            )
-
-    # Export scenario simulatore
     sim_xlsx = to_excel_bytes({
         "BASE_ATTIVI_2025": sim_work.rename(columns={"fatturato_2025": "fatturato_2025_attivi"}),
         "MOVIMENTI": moves_df,
@@ -656,23 +744,24 @@ with tab_sim:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# -------- TAB EXPORT TUTTO --------
+# =====================================================
+# TAB: EXPORT TUTTO
+# =====================================================
 with tab_export:
     st.subheader("Esporta tutte le tabelle in Excel (multi-foglio)")
 
     sheets_all = {
-        "FATT_CITTA_SINTESI": city_summary,
-        "FATT_CITTA_DETTAGLIO": city_detail,
+        "CITTA_SINTESI": city_summary,
+        "CITTA_DETTAGLIO": city_detail,
 
-        "FATT_AGENTE": agent_view,
+        "AGENTI": agent_view,
         "TOP3_AGENTI": top3_table,
         "DETT_CLIENTI_FLOW": agent_client_detail,
 
-        "ZONA_AGENTE_TOTALE": zone_agent_total,
-        "ZONA_AGENTE_CITTA": zone_agent_city,
-        "ZONA_CLIENTI_DETT": zone_client_detail,
+        "ZONA_AGENTE_CITTA": zone_agent_city_tot,
+        "ZONA_CLIENTI_DETT": zone_client_detail_tot,
 
-        "FATT_CATEGORIA": agent_category,
+        "CATEGORIA": agent_category,
     }
 
     all_xlsx = to_excel_bytes(sheets_all)
