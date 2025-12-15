@@ -19,19 +19,16 @@ STD = {
 }
 
 RENAME_MAP = {
-    # Anagrafiche
     "Città": STD["city"], "Citta": STD["city"], "CITTA": STD["city"],
     "Agente": STD["agent"], "AGENTE": STD["agent"],
     "Esercizio": STD["client"], "Cliente": STD["client"], "ESERCIZIO": STD["client"],
     "Categoria": STD["category"], "CATEGORIA": STD["category"],
     "Articolo": STD["article"], "ARTICOLO": STD["article"],
 
-    # Fatturati 2024
     "Fatturato 2024": STD["f24"],
     "Fatturato2024": STD["f24"],
     "Fatturato_2024": STD["f24"],
 
-    # Fatturati 2025
     "Fatturato 2025": STD["f25"],
     "Fatturato2025": STD["f25"],
     "Fatturato_2025": STD["f25"],
@@ -66,6 +63,13 @@ def load_excel(uploaded_file) -> pd.DataFrame:
     for c in [STD["f24"], STD["f25"]]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
+    # 🔥 FIX RIGA 0: elimino righe senza chiavi minime (Agente/Città/Cliente)
+    df = df[
+        (df[STD["agent"]] != "") &
+        (df[STD["city"]] != "") &
+        (df[STD["client"]] != "")
+    ].copy()
+
     return df
 
 
@@ -79,8 +83,8 @@ def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
 
 def add_total_row(df_in: pd.DataFrame, label_map: dict, sum_cols: list, first: bool = True) -> pd.DataFrame:
     df = df_in.copy()
-
     total = {c: np.nan for c in df.columns}
+
     for k, v in label_map.items():
         if k in total:
             total[k] = v
@@ -90,7 +94,6 @@ def add_total_row(df_in: pd.DataFrame, label_map: dict, sum_cols: list, first: b
             total[c] = df[c].sum()
 
     total_df = pd.DataFrame([total])
-
     if first:
         return pd.concat([total_df, df], ignore_index=True)
     return pd.concat([df, total_df], ignore_index=True)
@@ -107,7 +110,7 @@ def highlight_incidenza(val):
 # UI
 # =============================
 st.title("📊 Report Vendite (Analisi Città / Agente)")
-st.caption("VERSIONE APP: v4 - export per singolo tab + totali nominati + Top3 + incidenza%")
+st.caption("VERSIONE APP: v5 - fix righe fantasma + % incidenza categoria + export per tab")
 
 uploaded = st.file_uploader("Carica il file Excel", type=["xlsx", "xls"])
 if not uploaded:
@@ -120,10 +123,10 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-st.caption(f"Righe totali file: **{len(df):,}**".replace(",", "."))
+st.caption(f"Righe totali file (dopo pulizia chiavi): **{len(df):,}**".replace(",", "."))
 
 # =========================================================
-# Base corretta:
+# Base:
 # - ac_client_all: tutto il file aggregato a livello Agente-Città-Cliente
 # - ac_client_active: SOLO clienti attivi (fatt 2025 > 0)
 # =========================================================
@@ -139,7 +142,7 @@ if ac_client_active.empty:
     st.stop()
 
 st.caption(
-    f"Clienti/righe aggregati (tutto): **{len(ac_client_all):,}** | "
+    f"Clienti aggregati (tutto): **{len(ac_client_all):,}** | "
     f"Clienti attivi 2025 (fatt 2025 > 0): **{len(ac_client_active):,}**"
     .replace(",", ".")
 )
@@ -238,7 +241,6 @@ agent_client_detail = tmp[tmp["stato_cliente"].isin(["Perso", "Acquisito", "Mant
     [STD["agent"], STD["city"], STD["client"], STD["f24"], STD["f25"], "stato_cliente"]
 ].sort_values([STD["agent"], "stato_cliente", STD["f25"]], ascending=[True, True, False])
 
-# vista “pulita” per tabella/export
 agent_view = agent_report.rename(columns={STD["agent"]: "Agente"}).copy()
 agent_view = agent_view[
     [
@@ -255,7 +257,7 @@ agent_view = agent_view[
 
 # =============================
 # 3) FATTURATO PER ZONA (Agente -> Città) + dettaglio cliente - SOLO ATTIVI 2025
-# + Totali nominati e UNA volta sola
+# Totali nominati, UNA volta sola
 # =============================
 zone_agent_city = (
     ac_client_active.groupby([STD["agent"], STD["city"]], as_index=False)
@@ -299,17 +301,28 @@ zone_agent_total = (
 
 # =============================
 # 4) FATTURATO PER CATEGORIA - SOLO ATTIVI 2025
+# Qui mettiamo % incidenza sul fatturato dell'agente (2025)
 # =============================
 df_active_rows = df[df[STD["f25"]] > 0].copy()
 
+# Totale 2025 per agente (sul perimetro attivo 2025)
+agent_total_2025_active = (
+    df_active_rows.groupby(STD["agent"], as_index=False)
+      .agg(fatturato_agente_2025=(STD["f25"], "sum"))
+)
+
 agent_category = (
     df_active_rows.groupby([STD["agent"], STD["category"]], as_index=False)
-      .agg(
-          fatturato_categoria_2025=(STD["f25"], "sum"),
-          prodotti_distinti_nella_categoria=(STD["article"], "nunique"),
-      )
-      .sort_values([STD["agent"], "fatturato_categoria_2025"], ascending=[True, False])
+      .agg(fatturato_categoria_2025=(STD["f25"], "sum"))
+      .merge(agent_total_2025_active, on=STD["agent"], how="left")
 )
+
+agent_category["% incidenza su fatturato agente"] = (
+    agent_category["fatturato_categoria_2025"] / agent_category["fatturato_agente_2025"] * 100
+).replace([np.inf, -np.inf], np.nan).fillna(0).round(2)
+
+agent_category = agent_category.drop(columns=["fatturato_agente_2025"]) \
+                               .sort_values([STD["agent"], "fatturato_categoria_2025"], ascending=[True, False])
 
 # =============================
 # Tabs + Export per singolo tab
@@ -330,7 +343,6 @@ with tab1:
     st.subheader("Dettaglio: Agenti nella Città — SOLO clienti attivi 2025")
     st.dataframe(city_detail, use_container_width=True, height=520)
 
-    # Export tab 1
     city_xlsx = to_excel_bytes({
         "CITTA_SINTESI": city_summary,
         "CITTA_DETTAGLIO": city_detail
@@ -355,7 +367,6 @@ with tab2:
     st.subheader("Dettaglio clienti persi / acquisiti / mantenuti (per agente)")
     st.dataframe(agent_client_detail, use_container_width=True, height=520)
 
-    # Export tab 2
     agent_xlsx = to_excel_bytes({
         "AGENTI": agent_view,
         "TOP3": top3_table,
@@ -376,7 +387,6 @@ with tab3:
     st.subheader("Dettaglio: Clienti (Agente → Città → Cliente) — SOLO clienti attivi 2025")
     st.dataframe(zone_client_detail, use_container_width=True, height=520)
 
-    # Export tab 3
     zona_xlsx = to_excel_bytes({
         "ZONA_AGENTE_CITTA": zone_agent_city,
         "ZONA_CLIENTI_DETT": zone_client_detail,
@@ -394,7 +404,6 @@ with tab4:
     st.subheader("Fatturato per Categoria (Agente → Categoria) — SOLO clienti attivi 2025")
     st.dataframe(agent_category, use_container_width=True, height=650)
 
-    # Export tab 4
     cat_xlsx = to_excel_bytes({"CATEGORIA": agent_category})
     st.download_button(
         "⬇️ Scarica report Categoria (Excel)",
@@ -423,7 +432,6 @@ with tab5:
     }
 
     all_xlsx = to_excel_bytes(sheets_all)
-
     st.download_button(
         label="⬇️ Scarica Excel completo (tutti i fogli)",
         data=all_xlsx,
