@@ -1,5 +1,6 @@
 import io
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -11,10 +12,7 @@ import streamlit as st
 # ============================================================
 # CONFIG
 # ============================================================
-st.set_page_config(
-    page_title="Analisi Vendite & Ottimizzazione Area",
-    layout="wide",
-)
+st.set_page_config(page_title="Analisi Vendite & Ottimizzazione Area", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_XLSX = APP_DIR / "statisticatot25.xlsx"
@@ -52,8 +50,7 @@ def to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         for name, df in sheets.items():
-            df = df.copy()
-            safe_name = name[:31] if name else "Sheet1"
+            safe_name = (name or "Sheet1")[:31]
             df.to_excel(writer, index=False, sheet_name=safe_name)
     return output.getvalue()
 
@@ -65,15 +62,7 @@ def norm_col(s: str) -> str:
     if s is None:
         return ""
     s = str(s).strip().lower()
-    repl = (
-        ("à", "a"),
-        ("è", "e"),
-        ("é", "e"),
-        ("ì", "i"),
-        ("ò", "o"),
-        ("ù", "u"),
-        ("’", "'"),
-    )
+    repl = (("à", "a"), ("è", "e"), ("é", "e"), ("ì", "i"), ("ò", "o"), ("ù", "u"), ("’", "'"))
     for a, b in repl:
         s = s.replace(a, b)
     return s
@@ -82,25 +71,36 @@ def norm_col(s: str) -> str:
 COLUMN_SYNONYMS = {
     "agente": ["agente", "venditore", "sales", "seller", "commerciale"],
     "citta": ["citta", "città", "city", "comune", "localita", "località"],
-    "cliente": ["cliente", "client", "ragione sociale", "ragionesociale", "customer"],
-    "fatturato": ["fatturato", "valore", "importo", "revenue", "fatt", "vendite"],
+    "cliente": ["cliente", "client", "esercizio", "ragione sociale", "ragionesociale", "customer"],
     "categoria": ["categoria", "cat", "family", "gruppo", "category"],
-    "anno": ["anno", "year"],
+    "articolo": ["articolo", "prodotto", "item", "sku"],
+    "fatturato": ["fatturato", "valore", "importo", "revenue", "vendite", "acquistato"],
+    "anno": ["anno", "year"],  # opzionale nel tuo file
     "zona": ["zona", "area", "region", "territorio", "zone"],  # opzionale
 }
 
-REQUIRED_KEYS = ["agente", "citta", "cliente", "fatturato", "categoria", "anno"]
+# NEL TUO FILE: anno NON ESISTE -> lo rendiamo opzionale
+REQUIRED_KEYS = ["agente", "citta", "cliente", "categoria", "fatturato"]
 
 
 def guess_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    # mappa: nome_normalizzato -> nome_originale
     normed = {norm_col(c): c for c in df.columns}
     out: Dict[str, Optional[str]] = {k: None for k in COLUMN_SYNONYMS.keys()}
+
+    # match diretti sui sinonimi
     for key, syns in COLUMN_SYNONYMS.items():
         for s in syns:
             if norm_col(s) in normed:
                 out[key] = normed[norm_col(s)]
                 break
+
+    # fallback specifico: se c'è una colonna tipo "acquistato 2025"
+    if out["fatturato"] is None:
+        for c in df.columns:
+            if re.search(r"\b20\d{2}\b", str(c)) and re.search(r"acquist|fatt|vend|revenue|import", str(c), flags=re.I):
+                out["fatturato"] = c
+                break
+
     return out
 
 
@@ -111,6 +111,13 @@ def validate_map(colmap: Dict[str, Optional[str]]) -> Tuple[bool, List[str], boo
     return (len(missing) == 0, missing, has_duplicates)
 
 
+def infer_year_from_header(header: str) -> Optional[int]:
+    if not header:
+        return None
+    m = re.search(r"(20\d{2})", str(header))
+    return int(m.group(1)) if m else None
+
+
 # ============================================================
 # LETTURA EXCEL - CACHE
 # ============================================================
@@ -118,20 +125,14 @@ def validate_map(colmap: Dict[str, Optional[str]]) -> Tuple[bool, List[str], boo
 def load_excel_cached(file_bytes: Optional[bytes], file_path: str) -> pd.DataFrame:
     if file_bytes:
         bio = io.BytesIO(file_bytes)
-        df = pd.read_excel(bio, engine="openpyxl")
-    else:
-        df = pd.read_excel(file_path, engine="openpyxl")
-    return df
+        return pd.read_excel(bio, engine="openpyxl")
+    return pd.read_excel(file_path, engine="openpyxl")
 
 
 # ============================================================
 # CLEANING DATA
 # ============================================================
 def drop_totali_rows(df: pd.DataFrame, key_cols: List[str]) -> pd.DataFrame:
-    """
-    Esclude righe in cui una qualsiasi colonna chiave contiene 'Totali' (case-insensitive).
-    Implementazione vettoriale (molto più veloce di apply).
-    """
     masks = []
     for c in key_cols:
         if c in df.columns:
@@ -145,7 +146,7 @@ def drop_totali_rows(df: pd.DataFrame, key_cols: List[str]) -> pd.DataFrame:
     return df.loc[~mask_tot].copy()
 
 
-def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]]) -> pd.DataFrame:
+def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]], fixed_year: Optional[int]) -> pd.DataFrame:
     df = df_raw.copy()
 
     # Rinomina colonne selezionate in nomi standard interni
@@ -153,24 +154,29 @@ def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]]) ->
         colmap["agente"]: "agente",
         colmap["citta"]: "citta",
         colmap["cliente"]: "cliente",
-        colmap["fatturato"]: "fatturato",
         colmap["categoria"]: "categoria",
-        colmap["anno"]: "anno",
+        colmap["fatturato"]: "fatturato",
     }
+    if colmap.get("anno"):
+        rename[colmap["anno"]] = "anno"
     if colmap.get("zona"):
         rename[colmap["zona"]] = "zona"
+    if colmap.get("articolo"):
+        rename[colmap["articolo"]] = "articolo"
 
     df = df.rename(columns=rename)
 
-    # Keep colonne utili (solo se presenti)
-    keep = ["agente", "citta", "cliente", "fatturato", "categoria", "anno"]
+    keep = ["agente", "citta", "cliente", "categoria", "fatturato"]
+    if "anno" in df.columns:
+        keep.append("anno")
     if "zona" in df.columns:
         keep.append("zona")
+    if "articolo" in df.columns:
+        keep.append("articolo")
 
-    missing_after_rename = [c for c in keep if c not in df.columns]
-    if missing_after_rename:
-        # Non deve succedere se mapping ok, ma se succede: messaggio chiaro
-        raise KeyError(f"Mancano colonne dopo mapping: {missing_after_rename}")
+    missing = [c for c in keep if c not in df.columns]
+    if missing:
+        raise KeyError(f"Mancano colonne dopo mapping: {missing}")
 
     df = df[keep].copy()
 
@@ -180,13 +186,27 @@ def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]]) ->
 
     if "zona" in df.columns:
         df["zona"] = df["zona"].astype(str).str.strip()
+    if "articolo" in df.columns:
+        df["articolo"] = df["articolo"].astype(str).str.strip()
 
-    # Tipi
-    df["anno"] = pd.to_numeric(df["anno"], errors="coerce").fillna(0).astype(int)
+    # Tipi numerici
     df["fatturato"] = pd.to_numeric(df["fatturato"], errors="coerce").fillna(0.0).astype(float)
 
+    # Gestione anno:
+    # - se c'è colonna anno -> la uso
+    # - altrimenti -> imposto fixed_year (derivato da header tipo "acquistato 2025")
+    if "anno" in df.columns:
+        df["anno"] = pd.to_numeric(df["anno"], errors="coerce").fillna(0).astype(int)
+    else:
+        if not fixed_year:
+            fixed_year = 2025
+        df["anno"] = int(fixed_year)
+
     # Escludi righe "Totali"
-    df = drop_totali_rows(df, key_cols=["agente", "citta", "cliente", "categoria"])
+    key_cols = ["agente", "citta", "cliente", "categoria"]
+    if "articolo" in df.columns:
+        key_cols.append("articolo")
+    df = drop_totali_rows(df, key_cols=key_cols)
 
     # Drop righe senza dati chiave
     df = df[(df["agente"] != "") & (df["cliente"] != "")]
@@ -194,12 +214,10 @@ def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]]) ->
 
 
 def filter_active_clients_2025(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Considerare solo clienti con fatturato 2025 > 0
-    """
     df_2025 = df[df["anno"] == 2025].copy()
     if df_2025.empty:
-        return df.iloc[0:0].copy()  # nessun 2025 -> dataset vuoto
+        return df.iloc[0:0].copy()
+
     active = df_2025.groupby("cliente", as_index=False)["fatturato"].sum()
     active = active[active["fatturato"] > 0]["cliente"].unique().tolist()
     return df[df["cliente"].isin(active)].copy()
@@ -209,19 +227,11 @@ def filter_active_clients_2025(df: pd.DataFrame) -> pd.DataFrame:
 # REPORT
 # ============================================================
 def report_fatturato_per_citta(df_anno: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df_anno.groupby("citta", as_index=False)["fatturato"]
-        .sum()
-        .sort_values("fatturato", ascending=False)
-    )
+    return df_anno.groupby("citta", as_index=False)["fatturato"].sum().sort_values("fatturato", ascending=False)
 
 
 def report_fatturato_per_categoria(df_anno: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df_anno.groupby("categoria", as_index=False)["fatturato"]
-        .sum()
-        .sort_values("fatturato", ascending=False)
-    )
+    return df_anno.groupby("categoria", as_index=False)["fatturato"].sum().sort_values("fatturato", ascending=False)
 
 
 def report_fatturato_per_agente_2025(df: pd.DataFrame) -> pd.DataFrame:
@@ -230,11 +240,7 @@ def report_fatturato_per_agente_2025(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["agente", "fatturato", "clienti_attivi", "%_incidenza"])
 
     fatt = df_2025.groupby("agente", as_index=False)["fatturato"].sum()
-    clienti = (
-        df_2025.groupby("agente", as_index=False)["cliente"]
-        .nunique()
-        .rename(columns={"cliente": "clienti_attivi"})
-    )
+    clienti = df_2025.groupby("agente", as_index=False)["cliente"].nunique().rename(columns={"cliente": "clienti_attivi"})
     out = fatt.merge(clienti, on="agente", how="left")
 
     total = out["fatturato"].sum()
@@ -251,7 +257,7 @@ def report_agente_citta_cliente(df_anno: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# OTTIMIZZAZIONE AREA (euristica semplice e stabile)
+# OTTIMIZZAZIONE AREA
 # ============================================================
 def compute_agent_loads_2025(df_2025: pd.DataFrame, dispersion_weight: float) -> pd.DataFrame:
     if df_2025.empty:
@@ -279,7 +285,7 @@ def build_client_table_2025(df: pd.DataFrame) -> pd.DataFrame:
         df_2025.groupby(cols, as_index=False)["fatturato"]
         .sum()
         .rename(columns={"fatturato": "fatt_2025"})
-        .sort_values("fatt_2025", ascending=True)  # piccoli prima
+        .sort_values("fatt_2025", ascending=True)
     )
     return out
 
@@ -293,13 +299,7 @@ def simulate_reassignment(
     prefer_same_city: bool = True,
     max_moves: int = 10_000,
 ) -> Dict[str, pd.DataFrame]:
-    """
-    Euristica:
-    - sovraccarico: clienti > target_max_clienti
-    - sposta prima clienti piccoli
-    - assegna preferibilmente stessa città all’agente meno carico
-    - vincolo: il donatore non perde oltre max_fatt_loss_pct del suo fatturato 2025
-    """
+
     if df_clients.empty:
         return {
             "moves": pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"]),
@@ -309,28 +309,22 @@ def simulate_reassignment(
         }
 
     dfc = df_clients.copy()
-    dfc["movable"] = ~dfc["cliente"].isin(set(non_spostabili))
 
-    # snapshot iniziale
     before_clients = dfc[["agente", "citta", "cliente", "fatt_2025"]].copy()
     before_loads = compute_agent_loads_2025(
         before_clients.rename(columns={"fatt_2025": "fatturato"}).assign(anno=2025),
         dispersion_weight=dispersion_weight,
     )
 
-    # agent state
     agent_clients = dfc.groupby("agente")["cliente"].apply(lambda x: set(x.tolist())).to_dict()
     agent_cities = dfc.groupby("agente")["citta"].apply(lambda x: set(x.tolist())).to_dict()
     agent_fatt_init = dfc.groupby("agente")["fatt_2025"].sum().to_dict()
     agent_fatt = dict(agent_fatt_init)
 
-    # min fatt allowed for donor
     min_fatt_allowed = {a: agent_fatt_init.get(a, 0.0) * (1.0 - max_fatt_loss_pct) for a in agent_fatt_init.keys()}
 
-    # current lookups by client
     current_city_of = dfc.set_index("cliente")["citta"].to_dict()
     current_fatt_of = dfc.set_index("cliente")["fatt_2025"].to_dict()
-    current_agent_of = dfc.set_index("cliente")["agente"].to_dict()
 
     all_agents = sorted(agent_clients.keys())
 
@@ -346,7 +340,6 @@ def simulate_reassignment(
 
     city_agents = rebuild_city_agents()
 
-    # chi è sovraccarico?
     overloaded = [a for a in all_agents if len(agent_clients.get(a, set())) > target_max_clienti]
     overloaded = sorted(overloaded, key=lambda a: agent_load_score(a), reverse=True)
 
@@ -361,20 +354,14 @@ def simulate_reassignment(
 
     def pick_target(city: str, donor: str) -> Optional[str]:
         candidates = []
-
         if prefer_same_city:
             candidates = [a for a in city_agents.get(city, set()) if a != donor]
-
         if not candidates:
             candidates = [a for a in all_agents if a != donor]
-
         candidates = sorted(candidates, key=lambda a: agent_load_score(a))
-
-        # prova a non superare troppo la soglia
         for a in candidates:
             if len(agent_clients.get(a, set())) <= target_max_clienti:
                 return a
-
         return candidates[0] if candidates else None
 
     moves = []
@@ -382,20 +369,17 @@ def simulate_reassignment(
 
     for donor in overloaded:
         donor_clients = [c for c in agent_clients.get(donor, set()) if c not in non_spostabili]
-        donor_clients = sorted(donor_clients, key=lambda c: current_fatt_of.get(c, 0.0))  # piccoli prima
+        donor_clients = sorted(donor_clients, key=lambda c: float(current_fatt_of.get(c, 0.0)))
 
         for client in donor_clients:
             if moves_count >= max_moves:
                 break
-
-            # se donor è rientrato
             if len(agent_clients.get(donor, set())) <= target_max_clienti:
                 break
 
             fatt = float(current_fatt_of.get(client, 0.0))
             city = str(current_city_of.get(client, "") or "")
 
-            # vincolo fatturato donatore
             if (agent_fatt.get(donor, 0.0) - fatt) < min_fatt_allowed.get(donor, 0.0):
                 continue
 
@@ -403,73 +387,53 @@ def simulate_reassignment(
             if not target:
                 continue
 
-            # move
             agent_clients[donor].discard(client)
             agent_fatt[donor] = agent_fatt.get(donor, 0.0) - fatt
 
             agent_clients.setdefault(target, set()).add(client)
             agent_fatt[target] = agent_fatt.get(target, 0.0) + fatt
 
-            current_agent_of[client] = target
-
-            # aggiorna cities per donor e target (ricalcolo localizzato)
-            agent_cities[donor] = set(current_city_of[c] for c in agent_clients.get(donor, set()))
-            agent_cities[target] = set(current_city_of[c] for c in agent_clients.get(target, set()))
+            agent_cities[donor] = set(current_city_of.get(c, "") for c in agent_clients.get(donor, set()))
+            agent_cities[target] = set(current_city_of.get(c, "") for c in agent_clients.get(target, set()))
             city_agents = rebuild_city_agents()
 
-            moves.append(
-                {"cliente": client, "citta": city, "da_agente": donor, "a_agente": target, "fatt_2025": fatt}
-            )
+            moves.append({"cliente": client, "citta": city, "da_agente": donor, "a_agente": target, "fatt_2025": fatt})
             moves_count += 1
 
         if moves_count >= max_moves:
             break
 
-    moves_df = pd.DataFrame(moves).sort_values("fatt_2025", ascending=True) if moves else pd.DataFrame(
-        columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"]
-    )
+    moves_df = pd.DataFrame(moves) if moves else pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"])
 
-    # build after clients
     rows = []
     for a, clset in agent_clients.items():
         for c in clset:
-            rows.append(
-                {
-                    "agente": a,
-                    "citta": current_city_of.get(c, ""),
-                    "cliente": c,
-                    "fatt_2025": float(current_fatt_of.get(c, 0.0)),
-                }
-            )
+            rows.append({"agente": a, "citta": current_city_of.get(c, ""), "cliente": c, "fatt_2025": float(current_fatt_of.get(c, 0.0))})
     after_clients = pd.DataFrame(rows)
+
     after_loads = compute_agent_loads_2025(
         after_clients.rename(columns={"fatt_2025": "fatturato"}).assign(anno=2025),
         dispersion_weight=dispersion_weight,
     )
 
-    note_msg = (
-        f"Spostamenti: {len(moves_df)} | max_clienti={target_max_clienti} | "
-        f"peso_dispersione={dispersion_weight} | max_loss_fatt={max_fatt_loss_pct:.0%}"
-    )
+    note_msg = f"Spostamenti: {len(moves_df)} | max_clienti={target_max_clienti} | peso_dispersione={dispersion_weight} | max_loss_fatt={max_fatt_loss_pct:.0%}"
 
     return {
-        "moves": moves_df,
+        "moves": moves_df.sort_values("fatt_2025", ascending=True) if not moves_df.empty else moves_df,
         "before": before_loads,
         "after": after_loads,
-        "after_clients": after_clients.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False]),
+        "after_clients": after_clients.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False]) if not after_clients.empty else after_clients,
         "note": pd.DataFrame([{"msg": note_msg}]),
     }
 
 
 # ============================================================
-# UI - HEADER
+# UI
 # ============================================================
 st.title("📊 Analisi vendite + 🧭 Ottimizzazione area")
 
 with st.sidebar:
     st.header("Dati")
-
-    # IMPORTANT: su Streamlit Cloud è più sicuro default su UPLOAD
     mode = st.radio("Sorgente file", ["Upload Excel", "Locale (statisticatot25.xlsx)"], index=0)
 
     uploaded_bytes = None
@@ -490,9 +454,7 @@ with st.sidebar:
     st.header("Mapping colonne")
 
 
-# ============================================================
 # LOAD RAW
-# ============================================================
 try:
     df_raw = load_excel_cached(uploaded_bytes, file_path)
 except Exception as e:
@@ -505,17 +467,12 @@ if df_raw is None or df_raw.empty:
 
 df_cols = list(df_raw.columns)
 
-# guess + saved
 guess = guess_column_map(df_raw)
 saved_map = safe_read_json(COLUMN_MAP_FILE, default={})
 colmap_pref = {**guess, **saved_map}
-
 saved_non_movable = safe_read_json(NON_MOVABLE_FILE, default=[])
 
 
-# ============================================================
-# SIDEBAR - PICKERS (ANTI-ERRORI)
-# ============================================================
 with st.sidebar:
     st.caption("Seleziona le colonne corrette. Le obbligatorie devono essere tutte diverse.")
 
@@ -528,7 +485,6 @@ with st.sidebar:
             sel = st.selectbox(label, options=options, index=idx, key=f"map_{keyname}")
             return None if sel == "(non impostata)" else sel
 
-        # obbligatoria
         placeholder = "(seleziona...)"
         options = [placeholder] + df_cols
         idx = options.index(current) if current in options else 0
@@ -539,9 +495,10 @@ with st.sidebar:
     colmap_ui["agente"] = pick_col("Colonna Agente", "agente")
     colmap_ui["citta"] = pick_col("Colonna Città", "citta")
     colmap_ui["cliente"] = pick_col("Colonna Cliente", "cliente")
-    colmap_ui["fatturato"] = pick_col("Colonna Fatturato", "fatturato")
     colmap_ui["categoria"] = pick_col("Colonna Categoria", "categoria")
-    colmap_ui["anno"] = pick_col("Colonna Anno", "anno")
+    colmap_ui["fatturato"] = pick_col("Colonna Valore (es. acquistato 2025)", "fatturato")
+    colmap_ui["anno"] = pick_col("Colonna Anno (opzionale)", "anno", optional=True)
+    colmap_ui["articolo"] = pick_col("Colonna Articolo (opzionale)", "articolo", optional=True)
     colmap_ui["zona"] = pick_col("Colonna Zona (opzionale)", "zona", optional=True)
 
     ok, missing, has_dup = validate_map(colmap_ui)
@@ -552,33 +509,34 @@ with st.sidebar:
         st.error("Hai assegnato la stessa colonna a più campi. Seleziona colonne diverse.")
         st.stop()
 
+    fixed_year = None
+    if not colmap_ui.get("anno"):
+        fixed_year = infer_year_from_header(colmap_ui.get("fatturato") or "")
+        if fixed_year:
+            st.info(f"Anno dedotto dal nome colonna valore: {fixed_rb_year:=fixed_year}")
+        else:
+            fixed_year = st.number_input("Anno fisso per la colonna valore", min_value=2000, max_value=2100, value=2025, step=1)
+
     if st.button("💾 Salva mapping colonne"):
         safe_write_json(COLUMN_MAP_FILE, colmap_ui)
         st.success("Mapping salvato!")
 
 
-# ============================================================
 # PREP DATA
-# ============================================================
 try:
-    df = clean_and_prepare(df_raw, colmap_ui)
-except KeyError as e:
-    st.error(f"Errore mapping colonne: {e}")
-    st.stop()
+    df = clean_and_prepare(df_raw, colmap_ui, fixed_year=fixed_year)
 except Exception as e:
-    st.error(f"Errore pulizia dati: {e}")
+    st.error(f"Errore preparazione dati: {e}")
     st.stop()
 
 df = filter_active_clients_2025(df)
 
 if df.empty:
-    st.warning("Nessun cliente con fatturato 2025 > 0 (oppure anno 2025 assente).")
+    st.warning("Nessun cliente con valore 2025 > 0 (oppure anno 2025 assente).")
     st.stop()
 
 
-# ============================================================
 # FILTRI REPORT
-# ============================================================
 with st.sidebar:
     st.divider()
     st.header("Filtri report")
@@ -610,17 +568,13 @@ def apply_filters(d: pd.DataFrame) -> pd.DataFrame:
 df_year = apply_filters(df)
 
 
-# ============================================================
 # TABS
-# ============================================================
 tab_report, tab_opt, tab_data = st.tabs(["📈 Report", "🧭 Ottimizzazione area", "🧾 Anteprima dati"])
 
 
-# =========================
 # TAB REPORT
-# =========================
 with tab_report:
-    st.subheader(f"Report anno {year_sel} (solo clienti con fatturato 2025 > 0)")
+    st.subheader(f"Report anno {year_sel} (solo clienti con totale 2025 > 0)")
 
     c1, c2 = st.columns(2)
 
@@ -674,11 +628,9 @@ with tab_report:
     )
 
 
-# =========================
 # TAB OTTIMIZZAZIONE
-# =========================
 with tab_opt:
-    st.subheader("Ottimizzazione area (euristica): sovraccarico = clienti + dispersione città")
+    st.subheader("Ottimizzazione area: sovraccarico = clienti + dispersione città")
 
     df_clients = build_client_table_2025(df)
 
@@ -695,11 +647,7 @@ with tab_opt:
         all_clients = sorted(df_clients["cliente"].unique().tolist())
         default_nonmov = [c for c in saved_non_movable if c in all_clients]
 
-        non_movable_sel = st.multiselect(
-            "Seleziona clienti non spostabili",
-            options=all_clients,
-            default=default_nonmov,
-        )
+        non_movable_sel = st.multiselect("Seleziona clienti non spostabili", options=all_clients, default=default_nonmov)
 
         cbtn1, cbtn2 = st.columns(2)
         with cbtn1:
@@ -747,13 +695,6 @@ with tab_opt:
             st.markdown("### Dopo")
             st.dataframe(sim["after"].style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}), use_container_width=True, hide_index=True)
 
-        st.markdown("### Confronto load_score (Top 20 per 'Prima')")
-        if not sim["before"].empty:
-            before_plot = sim["before"].sort_values("load_score", ascending=False).head(20).set_index("agente")["load_score"]
-            after_plot = sim["after"].set_index("agente")["load_score"].reindex(before_plot.index).fillna(0)
-            chart_df = pd.DataFrame({"Prima": before_plot, "Dopo": after_plot})
-            st.bar_chart(chart_df)
-
         st.markdown("### Export simulazione (Excel)")
         sim_bytes = to_excel_bytes(
             {
@@ -776,9 +717,7 @@ with tab_opt:
     st.dataframe(df_clients.sort_values("fatt_2025", ascending=False), use_container_width=True, hide_index=True)
 
 
-# =========================
 # TAB DATA
-# =========================
 with tab_data:
     st.subheader("Anteprima dati puliti (Totali esclusi + solo clienti 2025>0)")
     st.write(f"Righe: {len(df):,}")
