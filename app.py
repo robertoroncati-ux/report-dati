@@ -513,7 +513,8 @@ with st.sidebar:
     if not colmap_ui.get("anno"):
         fixed_year = infer_year_from_header(colmap_ui.get("fatturato") or "")
         if fixed_year:
-            st.info(f"Anno dedotto dal nome colonna valore: {fixed_rb_year:=fixed_year}")
+            st.info(f"Anno dedotto dal nome colonna valore: {fixed_year}")
+
         else:
             fixed_year = st.number_input("Anno fisso per la colonna valore", min_value=2000, max_value=2100, value=2025, step=1)
 
