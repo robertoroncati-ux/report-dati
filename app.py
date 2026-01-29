@@ -79,7 +79,6 @@ COLUMN_SYNONYMS = {
     "zona": ["zona", "area", "region", "territorio", "zone"],  # opzionale
 }
 
-# Nel tuo file: anno NON ESISTE -> lo rendiamo opzionale
 REQUIRED_KEYS = ["agente", "citta", "cliente", "categoria", "fatturato"]
 
 
@@ -87,14 +86,12 @@ def guess_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     normed = {norm_col(c): c for c in df.columns}
     out: Dict[str, Optional[str]] = {k: None for k in COLUMN_SYNONYMS.keys()}
 
-    # match diretti sui sinonimi
     for key, syns in COLUMN_SYNONYMS.items():
         for s in syns:
             if norm_col(s) in normed:
                 out[key] = normed[norm_col(s)]
                 break
 
-    # fallback specifico: se c'è una colonna tipo "acquistato 2025"
     if out["fatturato"] is None:
         for c in df.columns:
             if re.search(r"\b20\d{2}\b", str(c)) and re.search(r"acquist|fatt|vend|revenue|import", str(c), flags=re.I):
@@ -149,7 +146,6 @@ def drop_totali_rows(df: pd.DataFrame, key_cols: List[str]) -> pd.DataFrame:
 def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]], fixed_year: Optional[int]) -> pd.DataFrame:
     df = df_raw.copy()
 
-    # Rinomina colonne selezionate in nomi standard interni
     rename = {
         colmap["agente"]: "agente",
         colmap["citta"]: "citta",
@@ -180,33 +176,25 @@ def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]], fi
 
     df = df[keep].copy()
 
-    # Pulizia stringhe
     for c in ["agente", "citta", "cliente", "categoria"]:
         df[c] = df[c].astype(str).str.strip()
-
     if "zona" in df.columns:
         df["zona"] = df["zona"].astype(str).str.strip()
     if "articolo" in df.columns:
         df["articolo"] = df["articolo"].astype(str).str.strip()
 
-    # Tipi numerici
     df["fatturato"] = pd.to_numeric(df["fatturato"], errors="coerce").fillna(0.0).astype(float)
 
-    # Anno:
     if "anno" in df.columns:
         df["anno"] = pd.to_numeric(df["anno"], errors="coerce").fillna(0).astype(int)
     else:
-        if not fixed_year:
-            fixed_year = 2025
-        df["anno"] = int(fixed_year)
+        df["anno"] = int(fixed_year or 2025)
 
-    # Escludi righe "Totali"
     key_cols = ["agente", "citta", "cliente", "categoria"]
     if "articolo" in df.columns:
         key_cols.append("articolo")
     df = drop_totali_rows(df, key_cols=key_cols)
 
-    # Drop righe senza dati chiave
     df = df[(df["agente"] != "") & (df["cliente"] != "")]
     return df
 
@@ -255,7 +243,7 @@ def report_agente_citta_cliente(df_anno: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# OTTIMIZZAZIONE AREA (automatico)
+# OTTIMIZZAZIONE
 # ============================================================
 def compute_agent_loads_2025(df_2025: pd.DataFrame, dispersion_weight: float) -> pd.DataFrame:
     if df_2025.empty:
@@ -288,12 +276,52 @@ def build_client_table_2025(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def apply_manual_overrides(df_clients: pd.DataFrame, overrides: Dict[str, str]) -> pd.DataFrame:
+    """overrides: {cliente -> nuovo_agente}"""
+    if df_clients.empty or not overrides:
+        return df_clients.copy()
+
+    ov = pd.DataFrame({"cliente": list(overrides.keys()), "agente_new": list(overrides.values())})
+    out = df_clients.merge(ov, on="cliente", how="left")
+    out["agente"] = out["agente_new"].fillna(out["agente"])
+    out = out.drop(columns=["agente_new"])
+    return out
+
+
+def loads_from_clients_table(df_clients_current: pd.DataFrame, dispersion_weight: float, all_agents: List[str]) -> pd.DataFrame:
+    """Carichi su tabella clienti 2025 + aggiunge agenti anche se a 0"""
+    if df_clients_current.empty:
+        base = pd.DataFrame(columns=["agente", "clienti", "citta_distinte", "fatturato", "load_score"])
+    else:
+        tmp = df_clients_current.rename(columns={"fatt_2025": "fatturato"}).copy()
+        tmp["anno"] = 2025
+        base = compute_agent_loads_2025(tmp, dispersion_weight=dispersion_weight)
+
+    # aggiungi agenti mancanti (nuovi a 0)
+    present = set(base["agente"].tolist()) if not base.empty else set()
+    missing = [a for a in all_agents if a not in present]
+    if missing:
+        add = pd.DataFrame(
+            {
+                "agente": missing,
+                "clienti": [0] * len(missing),
+                "citta_distinte": [0] * len(missing),
+                "fatturato": [0.0] * len(missing),
+            }
+        )
+        add["load_score"] = add["clienti"] + dispersion_weight * add["citta_distinte"]
+        base = pd.concat([base, add], ignore_index=True)
+
+    return base.sort_values("load_score", ascending=False)
+
+
 def simulate_reassignment(
     df_clients: pd.DataFrame,
     dispersion_weight: float,
     target_max_clienti: int,
     max_fatt_loss_pct: float,
     non_spostabili: List[str],
+    extra_agents: List[str],
     prefer_same_city: bool = True,
     max_moves: int = 10_000,
 ) -> Dict[str, pd.DataFrame]:
@@ -308,23 +336,28 @@ def simulate_reassignment(
 
     dfc = df_clients.copy()
 
-    before_clients = dfc[["agente", "citta", "cliente", "fatt_2025"]].copy()
-    before_loads = compute_agent_loads_2025(
-        before_clients.rename(columns={"fatt_2025": "fatturato"}).assign(anno=2025),
-        dispersion_weight=dispersion_weight,
-    )
-
+    # inizializza agenti (inclusi nuovi)
     agent_clients = dfc.groupby("agente")["cliente"].apply(lambda x: set(x.tolist())).to_dict()
     agent_cities = dfc.groupby("agente")["citta"].apply(lambda x: set(x.tolist())).to_dict()
     agent_fatt_init = dfc.groupby("agente")["fatt_2025"].sum().to_dict()
     agent_fatt = dict(agent_fatt_init)
 
-    min_fatt_allowed = {a: agent_fatt_init.get(a, 0.0) * (1.0 - max_fatt_loss_pct) for a in agent_fatt_init.keys()}
+    for a in extra_agents:
+        agent_clients.setdefault(a, set())
+        agent_cities.setdefault(a, set())
+        agent_fatt_init.setdefault(a, 0.0)
+        agent_fatt.setdefault(a, 0.0)
 
     current_city_of = dfc.set_index("cliente")["citta"].to_dict()
     current_fatt_of = dfc.set_index("cliente")["fatt_2025"].to_dict()
 
     all_agents = sorted(agent_clients.keys())
+
+    # BEFORE
+    before_clients = dfc[["agente", "citta", "cliente", "fatt_2025"]].copy()
+    before_loads = loads_from_clients_table(before_clients, dispersion_weight, all_agents)
+
+    min_fatt_allowed = {a: agent_fatt_init.get(a, 0.0) * (1.0 - max_fatt_loss_pct) for a in all_agents}
 
     def agent_load_score(a: str) -> float:
         return len(agent_clients.get(a, set())) + dispersion_weight * len(agent_cities.get(a, set()))
@@ -333,7 +366,8 @@ def simulate_reassignment(
         city_agents: Dict[str, set] = {}
         for a, cities in agent_cities.items():
             for city in cities:
-                city_agents.setdefault(city, set()).add(a)
+                if city:
+                    city_agents.setdefault(city, set()).add(a)
         return city_agents
 
     city_agents = rebuild_city_agents()
@@ -352,11 +386,12 @@ def simulate_reassignment(
 
     def pick_target(city: str, donor: str) -> Optional[str]:
         candidates = []
-        if prefer_same_city:
+        if prefer_same_city and city:
             candidates = [a for a in city_agents.get(city, set()) if a != donor]
         if not candidates:
             candidates = [a for a in all_agents if a != donor]
         candidates = sorted(candidates, key=lambda a: agent_load_score(a))
+        # preferisci chi è sotto target
         for a in candidates:
             if len(agent_clients.get(a, set())) <= target_max_clienti:
                 return a
@@ -367,7 +402,7 @@ def simulate_reassignment(
 
     for donor in overloaded:
         donor_clients = [c for c in agent_clients.get(donor, set()) if c not in non_spostabili]
-        donor_clients = sorted(donor_clients, key=lambda c: float(current_fatt_of.get(c, 0.0)))
+        donor_clients = sorted(donor_clients, key=lambda c: float(current_fatt_of.get(c, 0.0)))  # piccoli prima
 
         for client in donor_clients:
             if moves_count >= max_moves:
@@ -403,6 +438,7 @@ def simulate_reassignment(
 
     moves_df = pd.DataFrame(moves) if moves else pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"])
 
+    # AFTER clients table
     rows = []
     for a, clset in agent_clients.items():
         for c in clset:
@@ -410,11 +446,7 @@ def simulate_reassignment(
                 {"agente": a, "citta": current_city_of.get(c, ""), "cliente": c, "fatt_2025": float(current_fatt_of.get(c, 0.0))}
             )
     after_clients = pd.DataFrame(rows)
-
-    after_loads = compute_agent_loads_2025(
-        after_clients.rename(columns={"fatt_2025": "fatturato"}).assign(anno=2025),
-        dispersion_weight=dispersion_weight,
-    )
+    after_loads = loads_from_clients_table(after_clients, dispersion_weight, all_agents)
 
     note_msg = (
         f"Spostamenti: {len(moves_df)} | max_clienti={target_max_clienti} | "
@@ -431,32 +463,13 @@ def simulate_reassignment(
 
 
 # ============================================================
-# MANUALE - helpers
-# ============================================================
-def apply_manual_overrides(df_clients: pd.DataFrame, overrides: Dict[str, str]) -> pd.DataFrame:
-    """overrides: {cliente -> nuovo_agente}"""
-    if df_clients.empty or not overrides:
-        return df_clients.copy()
-
-    ov = pd.DataFrame({"cliente": list(overrides.keys()), "agente_new": list(overrides.values())})
-    out = df_clients.merge(ov, on="cliente", how="left")
-    out["agente"] = out["agente_new"].fillna(out["agente"])
-    out = out.drop(columns=["agente_new"])
-    return out
-
-
-def loads_from_clients_table(df_clients_current: pd.DataFrame, dispersion_weight: float) -> pd.DataFrame:
-    if df_clients_current.empty:
-        return pd.DataFrame(columns=["agente", "clienti", "citta_distinte", "fatturato", "load_score"])
-    tmp = df_clients_current.rename(columns={"fatt_2025": "fatturato"}).copy()
-    tmp["anno"] = 2025
-    return compute_agent_loads_2025(tmp, dispersion_weight=dispersion_weight)
-
-
-# ============================================================
 # UI
 # ============================================================
 st.title("📊 Analisi vendite + 🧭 Ottimizzazione area")
+
+# stato agenti extra (solo app)
+if "extra_agents" not in st.session_state:
+    st.session_state.extra_agents = []  # lista nomi agenti aggiunti in app
 
 with st.sidebar:
     st.header("Dati")
@@ -571,11 +584,12 @@ with st.sidebar:
     default_year = 2025 if 2025 in anni else (anni[-1] if anni else 2025)
     year_sel = st.selectbox("Anno", options=anni if anni else [2025], index=(anni.index(default_year) if anni and default_year in anni else 0))
 
-    agents_all = sorted(df["agente"].unique().tolist())
+    agents_all_base = sorted(df["agente"].unique().tolist())
+    # agenti extra sono usati solo in ottimizzazione, qui non ha senso filtrarli
     cities_all = sorted(df["citta"].unique().tolist())
     cats_all = sorted(df["categoria"].unique().tolist())
 
-    filt_agents = st.multiselect("Agenti", options=agents_all, default=[])
+    filt_agents = st.multiselect("Agenti", options=agents_all_base, default=[])
     filt_cities = st.multiselect("Città", options=cities_all, default=[])
     filt_cats = st.multiselect("Categorie", options=cats_all, default=[])
 
@@ -659,21 +673,64 @@ with tab_report:
 
 
 # =========================
-# TAB OTTIMIZZAZIONE (AUTO + MANUALE)
+# TAB OTTIMIZZAZIONE
 # =========================
 with tab_opt:
-    st.subheader("Ottimizzazione area: automatica + manuale")
+    st.subheader("Ottimizzazione area: automatica + manuale + agenti papabili")
 
+    # base clienti 2025 (da file)
     df_clients_base = build_client_table_2025(df)
 
-    # Stato sessione per manuale
+    # stato sessione per manuale
     if "manual_overrides" not in st.session_state:
         st.session_state.manual_overrides = {}  # {cliente: nuovo_agente}
     if "manual_moves" not in st.session_state:
         st.session_state.manual_moves = []  # lista dict
 
-    # Applica override manuali alla base
+    # applica override manuali alla base
     df_clients_current = apply_manual_overrides(df_clients_base, st.session_state.manual_overrides)
+
+    # lista agenti completa (file + papabili + quelli eventualmente già assegnati via override)
+    agents_from_file = sorted(df_clients_base["agente"].unique().tolist()) if not df_clients_base.empty else []
+    agents_from_overrides = sorted(list(set(st.session_state.manual_overrides.values()))) if st.session_state.manual_overrides else []
+    all_agents = sorted(list(set(agents_from_file + st.session_state.extra_agents + agents_from_overrides)))
+
+    # gestione agenti papabili
+    st.markdown("### 👤 Gestione agenti papabili (solo in app)")
+    colA, colB, colC = st.columns([1.2, 1.2, 1.6])
+    with colA:
+        new_agent_name = st.text_input("Nome nuovo agente", value="", placeholder="Es. Agente Nuovo 1")
+    with colB:
+        if st.button("➕ Aggiungi agente"):
+            name = (new_agent_name or "").strip()
+            if not name:
+                st.warning("Inserisci un nome agente.")
+            else:
+                # evita duplicati (case-insensitive)
+                low_all = {a.strip().lower() for a in all_agents}
+                if name.strip().lower() in low_all:
+                    st.info("Agente già presente (file o già aggiunto).")
+                else:
+                    st.session_state.extra_agents.append(name)
+                    st.success(f"Aggiunto: {name}")
+                    st.rerun()
+    with colC:
+        if st.session_state.extra_agents:
+            to_remove = st.selectbox("Rimuovi agente papabile", options=["(nessuno)"] + st.session_state.extra_agents)
+            if st.button("🗑️ Rimuovi selezionato"):
+                if to_remove != "(nessuno)":
+                    st.session_state.extra_agents = [a for a in st.session_state.extra_agents if a != to_remove]
+                    # se avevi già assegnato clienti a quell'agente via override, li rimettiamo al loro agente originale (file)
+                    # (scelta conservativa: evitiamo destinazioni “fantasma”)
+                    if st.session_state.manual_overrides:
+                        # rimettiamo solo quelli puntati a to_remove
+                        st.session_state.manual_overrides = {k: v for k, v in st.session_state.manual_overrides.items() if v != to_remove}
+                    st.success(f"Rimosso: {to_remove}")
+                    st.rerun()
+        else:
+            st.caption("Nessun agente papabile aggiunto.")
+
+    st.divider()
 
     sub_auto, sub_manual = st.tabs(["🤖 Automatica", "🖐️ Manuale"])
 
@@ -691,7 +748,6 @@ with tab_opt:
             st.markdown("#### Clienti NON spostabili")
             all_clients = sorted(df_clients_base["cliente"].unique().tolist()) if not df_clients_base.empty else []
             default_nonmov = [c for c in saved_non_movable if c in all_clients]
-
             non_movable_sel = st.multiselect("Lista non spostabili (persistente)", options=all_clients, default=default_nonmov)
 
             cbtn1, cbtn2 = st.columns(2)
@@ -709,12 +765,11 @@ with tab_opt:
             lock_manual = st.checkbox("Non toccare i clienti spostati a mano (consigliato)", value=True)
 
         with right:
-            st.markdown("#### Carichi attuali (2025)")
-            loads0 = loads_from_clients_table(df_clients_current, dispersion_weight=dispersion_weight)
+            st.markdown("#### Carichi attuali (2025) - includendo agenti papabili")
+            loads0 = loads_from_clients_table(df_clients_current, dispersion_weight=dispersion_weight, all_agents=all_agents)
             st.dataframe(loads0.style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}), use_container_width=True, hide_index=True)
 
         st.divider()
-
         run = st.button("🚀 Esegui simulazione automatica (prima/dopo)")
 
         if run:
@@ -730,6 +785,7 @@ with tab_opt:
                     target_max_clienti=int(target_max_clienti),
                     max_fatt_loss_pct=float(max_fatt_loss_pct),
                     non_spostabili=non_spost,
+                    extra_agents=st.session_state.extra_agents,
                     prefer_same_city=prefer_same_city,
                 )
 
@@ -751,8 +807,8 @@ with tab_opt:
             sim_bytes = to_excel_bytes(
                 {
                     "spostamenti_auto": sim["moves"],
-                    "prima_carichi": sim["before"],
-                    "dopo_carichi": sim["after"],
+                    "carichi_prima": sim["before"],
+                    "carichi_dopo": sim["after"],
                     "assegnazioni_dopo": sim.get("after_clients", pd.DataFrame()),
                 }
             )
@@ -776,16 +832,18 @@ with tab_opt:
             st.info("Nessun dato clienti 2025 disponibile.")
             st.stop()
 
-        # Parametri manuali
-        cP1, cP2 = st.columns(2)
+        cP1, cP2, cP3 = st.columns([1, 1, 1])
         with cP1:
             dispersion_weight_m = st.number_input("Peso dispersione (manuale)", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
         with cP2:
             max_fatt_loss_pct_m = st.slider("Max perdita fatturato donatore (manuale)", min_value=0, max_value=50, value=15, step=1) / 100.0
+        with cP3:
+            # i due ignore richiesti
+            ignore_fatt_vincolo = st.checkbox("Ignora vincolo fatturato (manuale)", value=False)
+            ignore_non_spostabili = st.checkbox("Ignora NON spostabili (manuale)", value=False)
 
         non_spostabili = safe_read_json(NON_MOVABLE_FILE, default=[])
 
-        # Scelte a cascata
         left, right = st.columns([1, 1])
 
         with left:
@@ -795,10 +853,24 @@ with tab_opt:
             df_city = df_clients_current[df_clients_current["citta"] == city_sel].copy()
             agents_in_city = sorted(df_city["agente"].dropna().unique().tolist())
 
-            src_agent = st.selectbox("Agente (sorgente)", options=agents_in_city)
+            # includiamo anche agenti papabili come destinazione “same city”
+            include_papabili_same_city = st.checkbox("Includi agenti papabili anche se non presenti in città", value=True)
+            if include_papabili_same_city and st.session_state.extra_agents:
+                for a in st.session_state.extra_agents:
+                    if a not in agents_in_city:
+                        agents_in_city.append(a)
+                agents_in_city = sorted(list(set(agents_in_city)))
+
+            # sorgente: solo agenti che hanno davvero clienti in città
+            src_agent_options = sorted(df_city["agente"].dropna().unique().tolist())
+            if not src_agent_options:
+                st.warning("In questa città non ci sono clienti assegnati a nessun agente.")
+                st.stop()
+
+            src_agent = st.selectbox("Agente (sorgente)", options=src_agent_options)
 
             df_src = df_city[df_city["agente"] == src_agent].copy()
-            df_src = df_src.sort_values("fatt_2025", ascending=True)  # piccoli prima
+            df_src = df_src.sort_values("fatt_2025", ascending=True)
 
             search = st.text_input("Cerca locale (opzionale)", value="")
             if search.strip():
@@ -818,23 +890,28 @@ with tab_opt:
             if only_same_city:
                 tgt_options = [a for a in agents_in_city if a != src_agent]
             else:
-                tgt_options = sorted(df_clients_current["agente"].dropna().unique().tolist())
-                tgt_options = [a for a in tgt_options if a != src_agent]
+                tgt_options = [a for a in all_agents if a != src_agent]
 
+            tgt_options = sorted(list(dict.fromkeys(tgt_options)))
             tgt_agent = st.selectbox("Agente (destinazione)", options=tgt_options if tgt_options else ["(nessuno)"])
 
-            st.markdown("### Carichi attuali (prima)")
-            loads_before = loads_from_clients_table(df_clients_current, dispersion_weight=dispersion_weight_m)
+            st.markdown("### Carichi attuali (prima) - includendo agenti papabili")
+            loads_before = loads_from_clients_table(df_clients_current, dispersion_weight=dispersion_weight_m, all_agents=all_agents)
             st.dataframe(loads_before.style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}), use_container_width=True, hide_index=True)
 
         st.divider()
 
+        # Bottone per prendere tutti i clienti (anche filtrati da ricerca)
+        move_all = st.button("🚚 Sposta TUTTI i locali dell’agente sorgente (rispetta ricerca)", disabled=(tgt_agent == "(nessuno)"))
+        if move_all:
+            sel_clients = df_src_view["cliente"].tolist()
+
         do_move = st.button("➡️ Sposta selezionati", disabled=(not sel_clients or tgt_agent == "(nessuno)"))
 
         if do_move:
-            # vincolo fatturato donatore
+            # fatturati per vincolo
             fatt_by_agent = df_clients_current.groupby("agente")["fatt_2025"].sum().to_dict()
-            min_allowed = {a: fatt_by_agent.get(a, 0.0) * (1.0 - max_fatt_loss_pct_m) for a in fatt_by_agent.keys()}
+            min_allowed = {a: fatt_by_agent.get(a, 0.0) * (1.0 - max_fatt_loss_pct_m) for a in all_agents}
 
             fatt_lookup = df_clients_current.set_index("cliente")["fatt_2025"].to_dict()
             city_lookup = df_clients_current.set_index("cliente")["citta"].to_dict()
@@ -844,16 +921,19 @@ with tab_opt:
             moved = 0
 
             for cl in sel_clients:
-                if cl in non_spostabili:
+                # non spostabili: solo se NON stai ignorando
+                if (not ignore_non_spostabili) and (cl in non_spostabili):
                     blocked.append((cl, "non spostabile"))
                     continue
 
                 current_agent = agent_lookup.get(cl, src_agent)
                 fatt = float(fatt_lookup.get(cl, 0.0))
 
-                if (fatt_by_agent.get(current_agent, 0.0) - fatt) < min_allowed.get(current_agent, 0.0):
-                    blocked.append((cl, "vincolo fatturato donatore"))
-                    continue
+                # vincolo fatturato donatore: solo se NON stai ignorando
+                if not ignore_fatt_vincolo:
+                    if (fatt_by_agent.get(current_agent, 0.0) - fatt) < min_allowed.get(current_agent, 0.0):
+                        blocked.append((cl, "vincolo fatturato donatore"))
+                        continue
 
                 # applica override
                 st.session_state.manual_overrides[cl] = tgt_agent
@@ -870,7 +950,7 @@ with tab_opt:
                     }
                 )
 
-                # aggiorna fatt_by_agent per eventuali controlli successivi nello stesso click
+                # aggiorna fatt_by_agent per controlli successivi nello stesso click
                 fatt_by_agent[current_agent] = fatt_by_agent.get(current_agent, 0.0) - fatt
                 fatt_by_agent[tgt_agent] = fatt_by_agent.get(tgt_agent, 0.0) + fatt
 
@@ -889,7 +969,12 @@ with tab_opt:
 
         moves_df = pd.DataFrame(st.session_state.manual_moves)
         df_after_manual = apply_manual_overrides(df_clients_base, st.session_state.manual_overrides)
-        loads_after = loads_from_clients_table(df_after_manual, dispersion_weight=dispersion_weight_m)
+
+        # ricalcola all_agents (potrebbero esserci nuove destinazioni in overrides)
+        agents_from_overrides = sorted(list(set(st.session_state.manual_overrides.values()))) if st.session_state.manual_overrides else []
+        all_agents_now = sorted(list(set(agents_from_file + st.session_state.extra_agents + agents_from_overrides)))
+
+        loads_after = loads_from_clients_table(df_after_manual, dispersion_weight=dispersion_weight_m, all_agents=all_agents_now)
 
         cA, cB = st.columns([1, 1])
 
@@ -907,10 +992,15 @@ with tab_opt:
         st.markdown("### Export manuale (Excel)")
         export_bytes = to_excel_bytes(
             {
-                "movimenti_manuali": moves_df if not moves_df.empty else pd.DataFrame(columns=["timestamp", "citta", "cliente", "da_agente", "a_agente", "fatt_2025"]),
-                "clienti_dopo_manuale": df_after_manual.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False]) if not df_after_manual.empty else df_after_manual,
+                "movimenti_manuali": moves_df
+                if not moves_df.empty
+                else pd.DataFrame(columns=["timestamp", "citta", "cliente", "da_agente", "a_agente", "fatt_2025"]),
+                "clienti_dopo_manuale": df_after_manual.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False])
+                if not df_after_manual.empty
+                else df_after_manual,
                 "carichi_prima": loads_before,
                 "carichi_dopo": loads_after,
+                "agenti_papabili": pd.DataFrame({"agente_papabile": st.session_state.extra_agents}),
             }
         )
 
