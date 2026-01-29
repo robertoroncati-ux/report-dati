@@ -1,7 +1,5 @@
 import io
 import json
-import os
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -10,9 +8,9 @@ import pandas as pd
 import streamlit as st
 
 
-# =========================
-# Config base
-# =========================
+# ============================================================
+# CONFIG
+# ============================================================
 st.set_page_config(
     page_title="Analisi Vendite & Ottimizzazione Area",
     layout="wide",
@@ -20,18 +18,18 @@ st.set_page_config(
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_XLSX = APP_DIR / "statisticatot25.xlsx"
+
 CACHE_DIR = APP_DIR / ".cache_app"
 CACHE_DIR.mkdir(exist_ok=True)
 
-SETTINGS_FILE = CACHE_DIR / "settings.json"
-NON_MOVABLE_FILE = CACHE_DIR / "non_spostabili.json"
 COLUMN_MAP_FILE = CACHE_DIR / "column_map.json"
+NON_MOVABLE_FILE = CACHE_DIR / "non_spostabili.json"
 
 
-# =========================
-# Util
-# =========================
-def _safe_read_json(path: Path, default):
+# ============================================================
+# UTIL - JSON SAFE
+# ============================================================
+def safe_read_json(path: Path, default):
     try:
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
@@ -40,51 +38,47 @@ def _safe_read_json(path: Path, default):
     return default
 
 
-def _safe_write_json(path: Path, data) -> None:
+def safe_write_json(path: Path, data) -> None:
     try:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
 
 
-def norm_col(s: str) -> str:
-    """Normalizza nomi colonne per matching robusto."""
-    if s is None:
-        return ""
-    return (
-        str(s)
-        .strip()
-        .lower()
-        .replace("à", "a")
-        .replace("è", "e")
-        .replace("é", "e")
-        .replace("ì", "i")
-        .replace("ò", "o")
-        .replace("ù", "u")
-    )
-
-
-def is_totali_row(row: pd.Series, key_cols: List[str]) -> bool:
-    """Esclude righe 'Totali' presenti in una qualsiasi delle colonne chiave."""
-    for c in key_cols:
-        if c in row and isinstance(row[c], str) and row[c].strip().lower() == "totali":
-            return True
-    return False
-
-
+# ============================================================
+# UTIL - EXCEL EXPORT
+# ============================================================
 def to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         for name, df in sheets.items():
-            # Excel sheet name max 31 chars
-            safe_name = name[:31]
+            df = df.copy()
+            safe_name = name[:31] if name else "Sheet1"
             df.to_excel(writer, index=False, sheet_name=safe_name)
     return output.getvalue()
 
 
-# =========================
-# Colonne attese + sinonimi
-# =========================
+# ============================================================
+# COLONNE - MAPPING ROBUSTO
+# ============================================================
+def norm_col(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    repl = (
+        ("à", "a"),
+        ("è", "e"),
+        ("é", "e"),
+        ("ì", "i"),
+        ("ò", "o"),
+        ("ù", "u"),
+        ("’", "'"),
+    )
+    for a, b in repl:
+        s = s.replace(a, b)
+    return s
+
+
 COLUMN_SYNONYMS = {
     "agente": ["agente", "venditore", "sales", "seller", "commerciale"],
     "citta": ["citta", "città", "city", "comune", "localita", "località"],
@@ -92,15 +86,14 @@ COLUMN_SYNONYMS = {
     "fatturato": ["fatturato", "valore", "importo", "revenue", "fatt", "vendite"],
     "categoria": ["categoria", "cat", "family", "gruppo", "category"],
     "anno": ["anno", "year"],
-    # opzionale
-    "zona": ["zona", "area", "region", "territorio", "zone"],
+    "zona": ["zona", "area", "region", "territorio", "zone"],  # opzionale
 }
-
 
 REQUIRED_KEYS = ["agente", "citta", "cliente", "fatturato", "categoria", "anno"]
 
 
 def guess_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    # mappa: nome_normalizzato -> nome_originale
     normed = {norm_col(c): c for c in df.columns}
     out: Dict[str, Optional[str]] = {k: None for k in COLUMN_SYNONYMS.keys()}
     for key, syns in COLUMN_SYNONYMS.items():
@@ -111,32 +104,51 @@ def guess_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     return out
 
 
-def validate_column_map(colmap: Dict[str, Optional[str]]) -> Tuple[bool, List[str]]:
+def validate_map(colmap: Dict[str, Optional[str]]) -> Tuple[bool, List[str], bool]:
     missing = [k for k in REQUIRED_KEYS if not colmap.get(k)]
-    return (len(missing) == 0, missing)
+    vals = [colmap[k] for k in REQUIRED_KEYS if colmap.get(k)]
+    has_duplicates = len(set(vals)) != len(vals)
+    return (len(missing) == 0, missing, has_duplicates)
 
 
-# =========================
-# Lettura dati + cache anti-freeze
-# =========================
+# ============================================================
+# LETTURA EXCEL - CACHE
+# ============================================================
 @st.cache_data(show_spinner=False)
-def load_excel_cached(file_bytes: Optional[bytes], file_path_str: str) -> pd.DataFrame:
-    """
-    Se file_bytes è valorizzato, legge da BytesIO (upload).
-    Se no, legge da path (locale).
-    """
+def load_excel_cached(file_bytes: Optional[bytes], file_path: str) -> pd.DataFrame:
     if file_bytes:
         bio = io.BytesIO(file_bytes)
         df = pd.read_excel(bio, engine="openpyxl")
     else:
-        df = pd.read_excel(file_path_str, engine="openpyxl")
+        df = pd.read_excel(file_path, engine="openpyxl")
     return df
 
 
-def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
+# ============================================================
+# CLEANING DATA
+# ============================================================
+def drop_totali_rows(df: pd.DataFrame, key_cols: List[str]) -> pd.DataFrame:
+    """
+    Esclude righe in cui una qualsiasi colonna chiave contiene 'Totali' (case-insensitive).
+    Implementazione vettoriale (molto più veloce di apply).
+    """
+    masks = []
+    for c in key_cols:
+        if c in df.columns:
+            s = df[c].astype(str).str.strip().str.lower()
+            masks.append(s.eq("totali"))
+    if not masks:
+        return df
+    mask_tot = masks[0]
+    for m in masks[1:]:
+        mask_tot = mask_tot | m
+    return df.loc[~mask_tot].copy()
+
+
+def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]]) -> pd.DataFrame:
     df = df_raw.copy()
 
-    # Rinomina in chiavi standard interne
+    # Rinomina colonne selezionate in nomi standard interni
     rename = {
         colmap["agente"]: "agente",
         colmap["citta"]: "citta",
@@ -150,16 +162,21 @@ def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFr
 
     df = df.rename(columns=rename)
 
-    # Keep solo colonne utili (se presenti)
+    # Keep colonne utili (solo se presenti)
     keep = ["agente", "citta", "cliente", "fatturato", "categoria", "anno"]
     if "zona" in df.columns:
         keep.append("zona")
-    df = df[keep]
+
+    missing_after_rename = [c for c in keep if c not in df.columns]
+    if missing_after_rename:
+        # Non deve succedere se mapping ok, ma se succede: messaggio chiaro
+        raise KeyError(f"Mancano colonne dopo mapping: {missing_after_rename}")
+
+    df = df[keep].copy()
 
     # Pulizia stringhe
     for c in ["agente", "citta", "cliente", "categoria"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str).str.strip()
+        df[c] = df[c].astype(str).str.strip()
 
     if "zona" in df.columns:
         df["zona"] = df["zona"].astype(str).str.strip()
@@ -169,92 +186,77 @@ def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFr
     df["fatturato"] = pd.to_numeric(df["fatturato"], errors="coerce").fillna(0.0).astype(float)
 
     # Escludi righe "Totali"
-    key_cols = ["agente", "citta", "cliente", "categoria"]
-    mask_tot = df.apply(lambda r: is_totali_row(r, key_cols), axis=1)
-    df = df.loc[~mask_tot].copy()
+    df = drop_totali_rows(df, key_cols=["agente", "citta", "cliente", "categoria"])
 
-    # Righe vuote / invalid
-    df = df[(df["cliente"] != "") & (df["agente"] != "")]
+    # Drop righe senza dati chiave
+    df = df[(df["agente"] != "") & (df["cliente"] != "")]
     return df
 
 
 def filter_active_clients_2025(df: pd.DataFrame) -> pd.DataFrame:
     """
     Considerare solo clienti con fatturato 2025 > 0
-    => tengo tutti i record (anche altri anni) solo per quei clienti,
-       ma di default report e ottimizzazione lavorano sul 2025.
     """
     df_2025 = df[df["anno"] == 2025].copy()
-    active = (
-        df_2025.groupby("cliente", as_index=False)["fatturato"]
-        .sum()
-        .rename(columns={"fatturato": "fatt_2025"})
-    )
-    active = active[active["fatt_2025"] > 0]["cliente"].unique().tolist()
+    if df_2025.empty:
+        return df.iloc[0:0].copy()  # nessun 2025 -> dataset vuoto
+    active = df_2025.groupby("cliente", as_index=False)["fatturato"].sum()
+    active = active[active["fatturato"] > 0]["cliente"].unique().tolist()
     return df[df["cliente"].isin(active)].copy()
 
 
-# =========================
-# Report
-# =========================
+# ============================================================
+# REPORT
+# ============================================================
 def report_fatturato_per_citta(df_anno: pd.DataFrame) -> pd.DataFrame:
-    out = (
+    return (
         df_anno.groupby("citta", as_index=False)["fatturato"]
         .sum()
         .sort_values("fatturato", ascending=False)
     )
-    return out
 
 
 def report_fatturato_per_categoria(df_anno: pd.DataFrame) -> pd.DataFrame:
-    out = (
+    return (
         df_anno.groupby("categoria", as_index=False)["fatturato"]
         .sum()
         .sort_values("fatturato", ascending=False)
     )
-    return out
 
 
 def report_fatturato_per_agente_2025(df: pd.DataFrame) -> pd.DataFrame:
     df_2025 = df[df["anno"] == 2025].copy()
+    if df_2025.empty:
+        return pd.DataFrame(columns=["agente", "fatturato", "clienti_attivi", "%_incidenza"])
 
     fatt = df_2025.groupby("agente", as_index=False)["fatturato"].sum()
-    clienti = df_2025.groupby("agente", as_index=False)["cliente"].nunique().rename(columns={"cliente": "clienti_attivi"})
+    clienti = (
+        df_2025.groupby("agente", as_index=False)["cliente"]
+        .nunique()
+        .rename(columns={"cliente": "clienti_attivi"})
+    )
     out = fatt.merge(clienti, on="agente", how="left")
 
     total = out["fatturato"].sum()
     out["%_incidenza"] = (out["fatturato"] / total * 100.0) if total > 0 else 0.0
-
-    out = out.sort_values("fatturato", ascending=False)
-    return out
+    return out.sort_values("fatturato", ascending=False)
 
 
-def report_zona_agente_citta_cliente(df_anno: pd.DataFrame) -> pd.DataFrame:
-    """
-    Report gerarchico: agente → città → cliente (con fatturato).
-    In tabella piatta, ordinata, così è filtrabile e esportabile.
-    """
-    out = (
+def report_agente_citta_cliente(df_anno: pd.DataFrame) -> pd.DataFrame:
+    return (
         df_anno.groupby(["agente", "citta", "cliente"], as_index=False)["fatturato"]
         .sum()
         .sort_values(["agente", "citta", "fatturato"], ascending=[True, True, False])
     )
-    return out
 
 
-# =========================
-# Ottimizzazione area (euristica)
-# =========================
-@dataclass
-class AgentLoad:
-    agente: str
-    clienti: int
-    citta_distinte: int
-    fatturato: float
-    load_score: float
+# ============================================================
+# OTTIMIZZAZIONE AREA (euristica semplice e stabile)
+# ============================================================
+def compute_agent_loads_2025(df_2025: pd.DataFrame, dispersion_weight: float) -> pd.DataFrame:
+    if df_2025.empty:
+        return pd.DataFrame(columns=["agente", "clienti", "citta_distinte", "fatturato", "load_score"])
 
-
-def compute_agent_loads(df_2025: pd.DataFrame, dispersion_weight: float) -> pd.DataFrame:
     base = df_2025.groupby("agente").agg(
         clienti=("cliente", "nunique"),
         citta_distinte=("citta", "nunique"),
@@ -266,6 +268,9 @@ def compute_agent_loads(df_2025: pd.DataFrame, dispersion_weight: float) -> pd.D
 
 def build_client_table_2025(df: pd.DataFrame) -> pd.DataFrame:
     df_2025 = df[df["anno"] == 2025].copy()
+    if df_2025.empty:
+        return pd.DataFrame(columns=["agente", "citta", "cliente", "categoria", "fatt_2025"])
+
     cols = ["agente", "citta", "cliente", "categoria"]
     if "zona" in df_2025.columns:
         cols.append("zona")
@@ -274,8 +279,8 @@ def build_client_table_2025(df: pd.DataFrame) -> pd.DataFrame:
         df_2025.groupby(cols, as_index=False)["fatturato"]
         .sum()
         .rename(columns={"fatturato": "fatt_2025"})
+        .sort_values("fatt_2025", ascending=True)  # piccoli prima
     )
-    out = out.sort_values("fatt_2025", ascending=True)  # piccoli prima
     return out
 
 
@@ -290,73 +295,48 @@ def simulate_reassignment(
 ) -> Dict[str, pd.DataFrame]:
     """
     Euristica:
-    - identifica agenti sovraccarichi (clienti > target_max_clienti OR load_score alto)
-    - sposta prima clienti piccoli (fatt_2025 basso)
-    - regola assegnazione: stessa città -> agente meno carico
-    - vincolo: non far perdere troppo fatturato agli agenti (max_fatt_loss_pct)
+    - sovraccarico: clienti > target_max_clienti
+    - sposta prima clienti piccoli
+    - assegna preferibilmente stessa città all’agente meno carico
+    - vincolo: il donatore non perde oltre max_fatt_loss_pct del suo fatturato 2025
     """
-    # Stato iniziale
+    if df_clients.empty:
+        return {
+            "moves": pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"]),
+            "before": pd.DataFrame(),
+            "after": pd.DataFrame(),
+            "note": pd.DataFrame([{"msg": "Nessun dato 2025 disponibile."}]),
+        }
+
     dfc = df_clients.copy()
     dfc["movable"] = ~dfc["cliente"].isin(set(non_spostabili))
 
-    # Per rapidità: indicizzazioni
-    # Fatturato per agente (iniziale)
-    fatt_init = dfc.groupby("agente")["fatt_2025"].sum().to_dict()
-    clienti_init = dfc.groupby("agente")["cliente"].nunique().to_dict()
+    # snapshot iniziale
+    before_clients = dfc[["agente", "citta", "cliente", "fatt_2025"]].copy()
+    before_loads = compute_agent_loads_2025(
+        before_clients.rename(columns={"fatt_2025": "fatturato"}).assign(anno=2025),
+        dispersion_weight=dispersion_weight,
+    )
 
-    # Carichi iniziali
-    def loads_snapshot(d: pd.DataFrame) -> pd.DataFrame:
-        return compute_agent_loads(
-            d.rename(columns={"fatt_2025": "fatturato"})[["agente", "citta", "cliente", "fatt_2025"]]
-             .rename(columns={"fatt_2025": "fatturato"})
-             .assign(anno=2025)  # dummy
-             .rename(columns={"fatturato": "fatturato"})[["agente", "citta", "cliente", "fatturato", "anno"]],
-            dispersion_weight=dispersion_weight
-        )
-
-    # Funzione alternativa più diretta (senza ricostruire) per prestazioni
-    def loads_fast(d: pd.DataFrame) -> pd.DataFrame:
-        base = d.groupby("agente").agg(
-            clienti=("cliente", "nunique"),
-            citta_distinte=("citta", "nunique"),
-            fatturato=("fatt_2025", "sum"),
-        ).reset_index()
-        base["load_score"] = base["clienti"] + dispersion_weight * base["citta_distinte"]
-        return base
-
-    loads = loads_fast(dfc)
-
-    # Definizione sovraccarico: clienti sopra soglia
-    # (se vuoi, qui puoi evolvere con percentili su load_score)
-    overloaded = loads[loads["clienti"] > target_max_clienti].copy()
-    overloaded = overloaded.sort_values("load_score", ascending=False)
-
-    # Se nessuno è sovraccarico, esci
-    if overloaded.empty:
-        return {
-            "moves": pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"]),
-            "before": loads.sort_values("load_score", ascending=False),
-            "after": loads.sort_values("load_score", ascending=False),
-            "note": pd.DataFrame([{"msg": "Nessun agente risulta sovraccarico con i parametri attuali."}]),
-        }
-
-    # Stato dinamico
-    current_agent_of = dfc.set_index("cliente")["agente"].to_dict()
-    current_city_of = dfc.set_index("cliente")["citta"].to_dict()
-    current_fatt_of = dfc.set_index("cliente")["fatt_2025"].to_dict()
-
-    # Tabelle dinamiche per agenti
+    # agent state
     agent_clients = dfc.groupby("agente")["cliente"].apply(lambda x: set(x.tolist())).to_dict()
     agent_cities = dfc.groupby("agente")["citta"].apply(lambda x: set(x.tolist())).to_dict()
-    agent_fatt = dfc.groupby("agente")["fatt_2025"].sum().to_dict()
+    agent_fatt_init = dfc.groupby("agente")["fatt_2025"].sum().to_dict()
+    agent_fatt = dict(agent_fatt_init)
+
+    # min fatt allowed for donor
+    min_fatt_allowed = {a: agent_fatt_init.get(a, 0.0) * (1.0 - max_fatt_loss_pct) for a in agent_fatt_init.keys()}
+
+    # current lookups by client
+    current_city_of = dfc.set_index("cliente")["citta"].to_dict()
+    current_fatt_of = dfc.set_index("cliente")["fatt_2025"].to_dict()
+    current_agent_of = dfc.set_index("cliente")["agente"].to_dict()
+
+    all_agents = sorted(agent_clients.keys())
 
     def agent_load_score(a: str) -> float:
-        c = len(agent_clients.get(a, set()))
-        z = len(agent_cities.get(a, set()))
-        return c + dispersion_weight * z
+        return len(agent_clients.get(a, set())) + dispersion_weight * len(agent_cities.get(a, set()))
 
-    # Per scegliere candidato in città
-    # pre-calcolo: per città, lista agenti che già hanno clienti lì
     def rebuild_city_agents() -> Dict[str, set]:
         city_agents: Dict[str, set] = {}
         for a, cities in agent_cities.items():
@@ -366,201 +346,196 @@ def simulate_reassignment(
 
     city_agents = rebuild_city_agents()
 
-    # Vincolo fatturato: non perdere oltre X% rispetto al fatturato iniziale (2025)
-    min_fatt_allowed = {a: fatt_init.get(a, 0.0) * (1.0 - max_fatt_loss_pct) for a in fatt_init.keys()}
+    # chi è sovraccarico?
+    overloaded = [a for a in all_agents if len(agent_clients.get(a, set())) > target_max_clienti]
+    overloaded = sorted(overloaded, key=lambda a: agent_load_score(a), reverse=True)
 
-    # Lista clienti spostabili ordinata per piccolo fatturato
-    # (ma andiamo agente per agente sovraccarico)
-    moves = []
-    moves_count = 0
+    if not overloaded:
+        return {
+            "moves": pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"]),
+            "before": before_loads,
+            "after": before_loads,
+            "after_clients": before_clients.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False]),
+            "note": pd.DataFrame([{"msg": "Nessun agente sovraccarico con i parametri attuali."}]),
+        }
 
-    # Utility: scegli miglior destinatario
-    all_agents = sorted(agent_clients.keys())
-
-    def pick_target_agent(city: str, donor: str) -> Optional[str]:
-        # candidati: stessa città se preferito
+    def pick_target(city: str, donor: str) -> Optional[str]:
         candidates = []
-        if prefer_same_city:
-            for a in city_agents.get(city, set()):
-                if a != donor:
-                    candidates.append(a)
 
-        # se vuoto, prova tutti
+        if prefer_same_city:
+            candidates = [a for a in city_agents.get(city, set()) if a != donor]
+
         if not candidates:
             candidates = [a for a in all_agents if a != donor]
 
-        # ordina per load_score crescente (meno carico)
         candidates = sorted(candidates, key=lambda a: agent_load_score(a))
 
-        # regole hard: non superare target_max_clienti (tolleranza piccola)
+        # prova a non superare troppo la soglia
         for a in candidates:
             if len(agent_clients.get(a, set())) <= target_max_clienti:
                 return a
 
-        # se tutti sopra, almeno prendi il meno carico
         return candidates[0] if candidates else None
 
-    # Processa agenti sovraccarichi
-    overloaded_agents = overloaded["agente"].tolist()
+    moves = []
+    moves_count = 0
 
-    for donor in overloaded_agents:
-        # clienti del donor ordinati per fatturato crescente e spostabili
+    for donor in overloaded:
         donor_clients = [c for c in agent_clients.get(donor, set()) if c not in non_spostabili]
-        donor_clients = sorted(donor_clients, key=lambda c: current_fatt_of.get(c, 0.0))
+        donor_clients = sorted(donor_clients, key=lambda c: current_fatt_of.get(c, 0.0))  # piccoli prima
 
         for client in donor_clients:
             if moves_count >= max_moves:
                 break
 
-            # se donor già sotto soglia clienti, stop
+            # se donor è rientrato
             if len(agent_clients.get(donor, set())) <= target_max_clienti:
                 break
 
-            city = current_city_of.get(client, "")
-            fatt = current_fatt_of.get(client, 0.0)
+            fatt = float(current_fatt_of.get(client, 0.0))
+            city = str(current_city_of.get(client, "") or "")
 
-            # vincolo: non far scendere donor sotto la soglia fatturato minima
+            # vincolo fatturato donatore
             if (agent_fatt.get(donor, 0.0) - fatt) < min_fatt_allowed.get(donor, 0.0):
                 continue
 
-            target = pick_target_agent(city=city, donor=donor)
+            target = pick_target(city, donor)
             if not target:
                 continue
 
-            # Esegui spostamento
-            # rimuovi da donor
+            # move
             agent_clients[donor].discard(client)
             agent_fatt[donor] = agent_fatt.get(donor, 0.0) - fatt
-            # città: potrebbe diventare vuota, va ricalcolata bene (per semplicità la ricalcoliamo smart)
-            # aggiungi a target
+
             agent_clients.setdefault(target, set()).add(client)
             agent_fatt[target] = agent_fatt.get(target, 0.0) + fatt
 
-            # aggiorna mapping cliente
             current_agent_of[client] = target
 
-            # ricostruzione city sets per donor/target (corretta ma rapida: aggiorno via ricalcolo solo per quei 2)
-            # donor cities
-            donor_cities = set(current_city_of[c] for c in agent_clients.get(donor, set()))
-            agent_cities[donor] = donor_cities
-            # target cities
-            target_cities = set(current_city_of[c] for c in agent_clients.get(target, set()))
-            agent_cities[target] = target_cities
-
-            # aggiorna city_agents (ricostruzione leggera e sicura)
+            # aggiorna cities per donor e target (ricalcolo localizzato)
+            agent_cities[donor] = set(current_city_of[c] for c in agent_clients.get(donor, set()))
+            agent_cities[target] = set(current_city_of[c] for c in agent_clients.get(target, set()))
             city_agents = rebuild_city_agents()
 
             moves.append(
-                {
-                    "cliente": client,
-                    "citta": city,
-                    "da_agente": donor,
-                    "a_agente": target,
-                    "fatt_2025": fatt,
-                }
+                {"cliente": client, "citta": city, "da_agente": donor, "a_agente": target, "fatt_2025": fatt}
             )
             moves_count += 1
 
         if moves_count >= max_moves:
             break
 
-    moves_df = pd.DataFrame(moves)
+    moves_df = pd.DataFrame(moves).sort_values("fatt_2025", ascending=True) if moves else pd.DataFrame(
+        columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"]
+    )
 
-    # BEFORE
-    before = loads_fast(dfc).sort_values("load_score", ascending=False)
-
-    # AFTER: costruisci df_after da agent_clients
+    # build after clients
     rows = []
-    for a, clients_set in agent_clients.items():
-        for c in clients_set:
+    for a, clset in agent_clients.items():
+        for c in clset:
             rows.append(
                 {
                     "agente": a,
                     "citta": current_city_of.get(c, ""),
                     "cliente": c,
-                    "fatt_2025": current_fatt_of.get(c, 0.0),
+                    "fatt_2025": float(current_fatt_of.get(c, 0.0)),
                 }
             )
     after_clients = pd.DataFrame(rows)
-    after = loads_fast(after_clients).sort_values("load_score", ascending=False)
+    after_loads = compute_agent_loads_2025(
+        after_clients.rename(columns={"fatt_2025": "fatturato"}).assign(anno=2025),
+        dispersion_weight=dispersion_weight,
+    )
+
+    note_msg = (
+        f"Spostamenti: {len(moves_df)} | max_clienti={target_max_clienti} | "
+        f"peso_dispersione={dispersion_weight} | max_loss_fatt={max_fatt_loss_pct:.0%}"
+    )
 
     return {
-        "moves": moves_df.sort_values("fatt_2025", ascending=True),
-        "before": before,
-        "after": after,
+        "moves": moves_df,
+        "before": before_loads,
+        "after": after_loads,
         "after_clients": after_clients.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False]),
-        "note": pd.DataFrame(
-            [{
-                "msg": f"Spostamenti effettuati: {len(moves_df)}. Parametri: max_clienti={target_max_clienti}, "
-                       f"peso_dispersione={dispersion_weight}, max_loss_fatt={max_fatt_loss_pct:.0%}."
-            }]
-        ),
+        "note": pd.DataFrame([{"msg": note_msg}]),
     }
 
 
-# =========================
-# UI
-# =========================
-st.title("📊 Analisi vendite + 🧭 Ottimizzazione area (Streamlit)")
+# ============================================================
+# UI - HEADER
+# ============================================================
+st.title("📊 Analisi vendite + 🧭 Ottimizzazione area")
 
 with st.sidebar:
     st.header("Dati")
-    mode = st.radio("Sorgente file", ["Locale (statisticatot25.xlsx)", "Upload Excel"], index=0)
+
+    # IMPORTANT: su Streamlit Cloud è più sicuro default su UPLOAD
+    mode = st.radio("Sorgente file", ["Upload Excel", "Locale (statisticatot25.xlsx)"], index=0)
 
     uploaded_bytes = None
     file_path = str(DEFAULT_XLSX)
 
     if mode == "Upload Excel":
         up = st.file_uploader("Carica statisticatot25.xlsx", type=["xlsx"])
-        if up is not None:
-            uploaded_bytes = up.getvalue()
-            file_path = up.name
+        if up is None:
+            st.info("Carica un file Excel per iniziare.")
+            st.stop()
+        uploaded_bytes = up.getvalue()
     else:
         if not DEFAULT_XLSX.exists():
-            st.warning("Non trovo statisticatot25.xlsx nella stessa cartella di app.py. Puoi usare Upload.")
-        file_path = str(DEFAULT_XLSX)
+            st.warning("Non trovo statisticatot25.xlsx accanto a app.py. Usa Upload Excel.")
+            st.stop()
 
     st.divider()
-    st.header("Impostazioni colonne")
+    st.header("Mapping colonne")
 
-# Carico settings
-saved_colmap = _safe_read_json(COLUMN_MAP_FILE, default={})
-saved_non_movable = _safe_read_json(NON_MOVABLE_FILE, default=[])
 
-# Leggi file (con cache)
-df_raw = None
+# ============================================================
+# LOAD RAW
+# ============================================================
 try:
-    if mode == "Upload Excel" and uploaded_bytes is None:
-        df_raw = None
-    else:
-        df_raw = load_excel_cached(uploaded_bytes, file_path)
+    df_raw = load_excel_cached(uploaded_bytes, file_path)
 except Exception as e:
     st.error(f"Errore lettura Excel: {e}")
-
-if df_raw is None:
-    st.info("Carica un file Excel (upload) oppure metti statisticatot25.xlsx accanto a app.py.")
     st.stop()
 
-# Mappa colonne (guess + fallback a salvato)
-guess = guess_column_map(df_raw)
-colmap = {**guess, **saved_colmap}  # salvato vince
+if df_raw is None or df_raw.empty:
+    st.error("Excel vuoto o non leggibile.")
+    st.stop()
 
-# Sidebar mapping interattivo
+df_cols = list(df_raw.columns)
+
+# guess + saved
+guess = guess_column_map(df_raw)
+saved_map = safe_read_json(COLUMN_MAP_FILE, default={})
+colmap_pref = {**guess, **saved_map}
+
+saved_non_movable = safe_read_json(NON_MOVABLE_FILE, default=[])
+
+
+# ============================================================
+# SIDEBAR - PICKERS (ANTI-ERRORI)
+# ============================================================
 with st.sidebar:
-    df_cols = list(df_raw.columns)
+    st.caption("Seleziona le colonne corrette. Le obbligatorie devono essere tutte diverse.")
 
     def pick_col(label: str, keyname: str, optional: bool = False) -> Optional[str]:
-        current = colmap.get(keyname)
-        options = ["(non impostata)"] + df_cols if optional else df_cols
-        idx = 0
-        if current in df_cols:
-            idx = options.index(current) if current in options else 0
-        sel = st.selectbox(label, options=options, index=idx, key=f"map_{keyname}")
-        if optional and sel == "(non impostata)":
-            return None
-        return sel
+        current = colmap_pref.get(keyname)
 
-    colmap_ui = {}
+        if optional:
+            options = ["(non impostata)"] + df_cols
+            idx = options.index(current) if current in options else 0
+            sel = st.selectbox(label, options=options, index=idx, key=f"map_{keyname}")
+            return None if sel == "(non impostata)" else sel
+
+        # obbligatoria
+        placeholder = "(seleziona...)"
+        options = [placeholder] + df_cols
+        idx = options.index(current) if current in options else 0
+        sel = st.selectbox(label, options=options, index=idx, key=f"map_{keyname}")
+        return None if sel == placeholder else sel
+
+    colmap_ui: Dict[str, Optional[str]] = {}
     colmap_ui["agente"] = pick_col("Colonna Agente", "agente")
     colmap_ui["citta"] = pick_col("Colonna Città", "citta")
     colmap_ui["cliente"] = pick_col("Colonna Cliente", "cliente")
@@ -569,23 +544,44 @@ with st.sidebar:
     colmap_ui["anno"] = pick_col("Colonna Anno", "anno")
     colmap_ui["zona"] = pick_col("Colonna Zona (opzionale)", "zona", optional=True)
 
-    ok, missing = validate_column_map(colmap_ui)
+    ok, missing, has_dup = validate_map(colmap_ui)
     if not ok:
-        st.error(f"Colonne mancanti: {', '.join(missing)}")
+        st.error(f"Mancano colonne: {', '.join(missing)}")
+        st.stop()
+    if has_dup:
+        st.error("Hai assegnato la stessa colonna a più campi. Seleziona colonne diverse.")
         st.stop()
 
     if st.button("💾 Salva mapping colonne"):
-        _safe_write_json(COLUMN_MAP_FILE, colmap_ui)
-        st.success("Salvato!")
+        safe_write_json(COLUMN_MAP_FILE, colmap_ui)
+        st.success("Mapping salvato!")
 
-# Preparazione dati
-df = clean_and_prepare(df_raw, colmap_ui)
+
+# ============================================================
+# PREP DATA
+# ============================================================
+try:
+    df = clean_and_prepare(df_raw, colmap_ui)
+except KeyError as e:
+    st.error(f"Errore mapping colonne: {e}")
+    st.stop()
+except Exception as e:
+    st.error(f"Errore pulizia dati: {e}")
+    st.stop()
+
 df = filter_active_clients_2025(df)
 
-# Filtri generali
+if df.empty:
+    st.warning("Nessun cliente con fatturato 2025 > 0 (oppure anno 2025 assente).")
+    st.stop()
+
+
+# ============================================================
+# FILTRI REPORT
+# ============================================================
 with st.sidebar:
     st.divider()
-    st.header("Filtri (report)")
+    st.header("Filtri report")
 
     anni = sorted([a for a in df["anno"].unique().tolist() if a != 0])
     default_year = 2025 if 2025 in anni else (anni[-1] if anni else 2025)
@@ -599,9 +595,9 @@ with st.sidebar:
     filt_cities = st.multiselect("Città", options=cities_all, default=[])
     filt_cats = st.multiselect("Categorie", options=cats_all, default=[])
 
+
 def apply_filters(d: pd.DataFrame) -> pd.DataFrame:
-    out = d.copy()
-    out = out[out["anno"] == int(year_sel)]
+    out = d[d["anno"] == int(year_sel)].copy()
     if filt_agents:
         out = out[out["agente"].isin(filt_agents)]
     if filt_cities:
@@ -610,14 +606,19 @@ def apply_filters(d: pd.DataFrame) -> pd.DataFrame:
         out = out[out["categoria"].isin(filt_cats)]
     return out
 
+
 df_year = apply_filters(df)
 
-# Tabs
+
+# ============================================================
+# TABS
+# ============================================================
 tab_report, tab_opt, tab_data = st.tabs(["📈 Report", "🧭 Ottimizzazione area", "🧾 Anteprima dati"])
 
-# -------------------------
-# Report
-# -------------------------
+
+# =========================
+# TAB REPORT
+# =========================
 with tab_report:
     st.subheader(f"Report anno {year_sel} (solo clienti con fatturato 2025 > 0)")
 
@@ -650,11 +651,12 @@ with tab_report:
     st.divider()
 
     st.markdown("### Fatturato per zona (agente → città → cliente)")
-    rep_zone = report_zona_agente_citta_cliente(df_year)
+    rep_zone = report_agente_citta_cliente(df_year)
     st.dataframe(rep_zone, use_container_width=True, hide_index=True)
 
-    # Export report
+    st.divider()
     st.markdown("### Export report (Excel)")
+
     report_bytes = to_excel_bytes(
         {
             f"fatturato_citta_{year_sel}": rep_city,
@@ -663,6 +665,7 @@ with tab_report:
             f"agente_citta_cliente_{year_sel}": rep_zone,
         }
     )
+
     st.download_button(
         "⬇️ Scarica Report Excel",
         data=report_bytes,
@@ -670,9 +673,10 @@ with tab_report:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# -------------------------
-# Ottimizzazione area
-# -------------------------
+
+# =========================
+# TAB OTTIMIZZAZIONE
+# =========================
 with tab_opt:
     st.subheader("Ottimizzazione area (euristica): sovraccarico = clienti + dispersione città")
 
@@ -700,20 +704,18 @@ with tab_opt:
         cbtn1, cbtn2 = st.columns(2)
         with cbtn1:
             if st.button("💾 Salva lista NON spostabili"):
-                _safe_write_json(NON_MOVABLE_FILE, non_movable_sel)
+                safe_write_json(NON_MOVABLE_FILE, non_movable_sel)
                 st.success("Salvata!")
         with cbtn2:
             if st.button("🧹 Svuota lista"):
                 non_movable_sel = []
-                _safe_write_json(NON_MOVABLE_FILE, non_movable_sel)
+                safe_write_json(NON_MOVABLE_FILE, non_movable_sel)
                 st.success("Svuotata!")
 
     with right:
         st.markdown("#### Situazione iniziale (2025)")
-        loads0 = compute_agent_loads(
-            df[df["anno"] == 2025][["agente", "citta", "cliente", "fatturato", "anno"]].copy(),
-            dispersion_weight=dispersion_weight,
-        )
+        df_2025_for_loads = df[df["anno"] == 2025].copy()
+        loads0 = compute_agent_loads_2025(df_2025_for_loads, dispersion_weight=dispersion_weight)
         st.dataframe(loads0.style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}), use_container_width=True, hide_index=True)
 
     st.divider()
@@ -724,7 +726,7 @@ with tab_opt:
         with st.spinner("Simulazione in corso..."):
             sim = simulate_reassignment(
                 df_clients=df_clients,
-                dispersion_weight=dispersion_weight,
+                dispersion_weight=float(dispersion_weight),
                 target_max_clienti=int(target_max_clienti),
                 max_fatt_loss_pct=float(max_fatt_loss_pct),
                 non_spostabili=non_movable_sel,
@@ -732,7 +734,6 @@ with tab_opt:
             )
 
         st.success("Simulazione completata.")
-
         st.info(sim["note"].iloc[0]["msg"] if not sim["note"].empty else "OK")
 
         st.markdown("### Spostamenti effettuati (clienti piccoli prima)")
@@ -746,28 +747,23 @@ with tab_opt:
             st.markdown("### Dopo")
             st.dataframe(sim["after"].style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}), use_container_width=True, hide_index=True)
 
-        # Grafico prima/dopo load_score per agente (top 20)
         st.markdown("### Confronto load_score (Top 20 per 'Prima')")
-        before_plot = sim["before"].sort_values("load_score", ascending=False).head(20).set_index("agente")[["load_score"]]
-        after_plot = sim["after"].set_index("agente")[["load_score"]].reindex(before_plot.index).fillna(0)
+        if not sim["before"].empty:
+            before_plot = sim["before"].sort_values("load_score", ascending=False).head(20).set_index("agente")["load_score"]
+            after_plot = sim["after"].set_index("agente")["load_score"].reindex(before_plot.index).fillna(0)
+            chart_df = pd.DataFrame({"Prima": before_plot, "Dopo": after_plot})
+            st.bar_chart(chart_df)
 
-        chart_df = pd.DataFrame({
-            "Prima": before_plot["load_score"],
-            "Dopo": after_plot["load_score"],
-        })
-        st.bar_chart(chart_df)
-
-        # Export Excel simulazione
         st.markdown("### Export simulazione (Excel)")
-        export_sheets = {
-            "spostamenti": sim["moves"],
-            "prima_carichi": sim["before"],
-            "dopo_carichi": sim["after"],
-        }
-        if "after_clients" in sim:
-            export_sheets["assegnazioni_dopo"] = sim["after_clients"]
+        sim_bytes = to_excel_bytes(
+            {
+                "spostamenti": sim["moves"],
+                "prima_carichi": sim["before"],
+                "dopo_carichi": sim["after"],
+                "assegnazioni_dopo": sim.get("after_clients", pd.DataFrame()),
+            }
+        )
 
-        sim_bytes = to_excel_bytes(export_sheets)
         st.download_button(
             "⬇️ Scarica Simulazione Excel (prima/dopo)",
             data=sim_bytes,
@@ -779,11 +775,11 @@ with tab_opt:
     st.markdown("#### Tabella clienti 2025 (base ottimizzazione)")
     st.dataframe(df_clients.sort_values("fatt_2025", ascending=False), use_container_width=True, hide_index=True)
 
-# -------------------------
-# Anteprima dati
-# -------------------------
-with tab_data:
-    st.subheader("Anteprima dati puliti (dopo esclusione Totali + solo clienti 2025>0)")
-    st.write(f"Righe: {len(df):,}")
-    st.dataframe(df.head(200), use_container_width=True, hide_index=True)
 
+# =========================
+# TAB DATA
+# =========================
+with tab_data:
+    st.subheader("Anteprima dati puliti (Totali esclusi + solo clienti 2025>0)")
+    st.write(f"Righe: {len(df):,}")
+    st.dataframe(df.head(300), use_container_width=True, hide_index=True)
