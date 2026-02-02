@@ -15,12 +15,14 @@ import streamlit as st
 st.set_page_config(page_title="Analisi Vendite & Ottimizzazione Area", layout="wide")
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_XLSX = APP_DIR / "statisticatot25.xlsx"
+DEFAULT_VENDITE_XLSX = APP_DIR / "statisticatot25.xlsx"
+DEFAULT_PROVV_FILE = APP_DIR / "Progetto_ponente_26.xls"  # opzionale se lo tieni accanto
 
 CACHE_DIR = APP_DIR / ".cache_app"
 CACHE_DIR.mkdir(exist_ok=True)
 
-COLUMN_MAP_FILE = CACHE_DIR / "column_map.json"
+COLUMN_MAP_VENDITE_FILE = CACHE_DIR / "column_map_vendite.json"
+COLUMN_MAP_PROVV_FILE = CACHE_DIR / "column_map_provv.json"
 NON_MOVABLE_FILE = CACHE_DIR / "non_spostabili.json"
 
 
@@ -68,45 +70,48 @@ def norm_col(s: str) -> str:
     return s
 
 
-COLUMN_SYNONYMS = {
-    "agente": ["agente", "venditore", "sales", "seller", "commerciale"],
+VENDITE_SYNONYMS = {
+    "agente": ["agente", "venditore", "sales", "seller", "commerciale", "codice agente"],
     "citta": ["citta", "città", "city", "comune", "localita", "località"],
-    "cliente": ["cliente", "client", "esercizio", "ragione sociale", "ragionesociale", "customer"],
+    "cliente": ["cliente", "client", "esercizio", "ragione sociale", "ragionesociale", "customer", "nominativo cliente"],
     "categoria": ["categoria", "cat", "family", "gruppo", "category"],
     "articolo": ["articolo", "prodotto", "item", "sku"],
     "fatturato": ["fatturato", "valore", "importo", "revenue", "vendite", "acquistato"],
     "anno": ["anno", "year"],
     "zona": ["zona", "area", "region", "territorio", "zone"],
 }
-REQUIRED_KEYS = ["agente", "citta", "cliente", "categoria", "fatturato"]
+
+PROVV_SYNONYMS = {
+    "cod_agente": ["codice agente", "cod agente", "cod_agente", "id agente"],
+    "agente": ["agente", "venditore", "sales", "seller", "commerciale"],
+    "cod_cliente": ["cod cliente", "codice cliente", "cod_cliente", "id cliente", "cliente codice", "cod cliente "],
+    "cliente_nome": ["nominativo cliente", "ragione sociale", "cliente", "esercizio", "customer"],
+    "citta": ["citta", "città", "city", "comune", "localita", "località"],
+    "prov": ["pr", "provincia", "prov"],
+    "fatt_provv": ["fatturato per calcolo provvigioni", "fatturato provvigioni", "imponibile provvigioni", "base provvigioni"],
+    "provvigione": ["importo provvigione", "provvigione", "commissione", "commissions"],
+    "indirizzo": ["indirizzo", "address"],
+    "cap": ["cap", "zip"],
+}
+
+REQUIRED_VENDITE = ["agente", "citta", "cliente", "categoria", "fatturato"]
+REQUIRED_PROVV = ["cod_cliente", "provvigione"]
 
 
-def guess_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+def guess_map(df: pd.DataFrame, synonyms: Dict[str, List[str]]) -> Dict[str, Optional[str]]:
     normed = {norm_col(c): c for c in df.columns}
-    out: Dict[str, Optional[str]] = {k: None for k in COLUMN_SYNONYMS.keys()}
-
-    # match diretti
-    for key, syns in COLUMN_SYNONYMS.items():
+    out: Dict[str, Optional[str]] = {k: None for k in synonyms.keys()}
+    for key, syns in synonyms.items():
         for s in syns:
             if norm_col(s) in normed:
                 out[key] = normed[norm_col(s)]
                 break
-
-    # fallback: "acquistato 2025" / simili
-    if out["fatturato"] is None:
-        for c in df.columns:
-            if re.search(r"\b20\d{2}\b", str(c)) and re.search(
-                r"acquist|fatt|vend|revenue|import", str(c), flags=re.I
-            ):
-                out["fatturato"] = c
-                break
-
     return out
 
 
-def validate_map(colmap: Dict[str, Optional[str]]) -> Tuple[bool, List[str], bool]:
-    missing = [k for k in REQUIRED_KEYS if not colmap.get(k)]
-    vals = [colmap[k] for k in REQUIRED_KEYS if colmap.get(k)]
+def validate_map(colmap: Dict[str, Optional[str]], required_keys: List[str]) -> Tuple[bool, List[str], bool]:
+    missing = [k for k in required_keys if not colmap.get(k)]
+    vals = [colmap[k] for k in required_keys if colmap.get(k)]
     has_duplicates = len(set(vals)) != len(vals)
     return (len(missing) == 0, missing, has_duplicates)
 
@@ -118,19 +123,39 @@ def infer_year_from_header(header: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def extract_client_code(s: str) -> str:
+    """
+    Estrae il codice cliente dal campo "cliente" delle vendite.
+    Esempi:
+      "C70987003 - NOME" -> "C70987003"
+      "C70987003" -> "C70987003"
+      "70987003 - NOME" -> "70987003"
+    """
+    if s is None:
+        return ""
+    t = str(s).strip()
+    if not t:
+        return ""
+    # prende tutto prima di " - " se presente
+    left = t.split(" - ")[0].strip()
+    # oppure prima di "-" senza spazi
+    left = left.split("-")[0].strip()
+    return left
+
+
 # ============================================================
-# LETTURA EXCEL - CACHE
+# LETTURA FILE - CACHE
 # ============================================================
 @st.cache_data(show_spinner=False)
 def load_excel_cached(file_bytes: Optional[bytes], file_path: str) -> pd.DataFrame:
     if file_bytes:
         bio = io.BytesIO(file_bytes)
-        return pd.read_excel(bio, engine="openpyxl")
-    return pd.read_excel(file_path, engine="openpyxl")
+        return pd.read_excel(bio)
+    return pd.read_excel(file_path)
 
 
 # ============================================================
-# CLEANING DATA
+# CLEANING VENDITE
 # ============================================================
 def drop_totali_rows(df: pd.DataFrame, key_cols: List[str]) -> pd.DataFrame:
     masks = []
@@ -146,7 +171,7 @@ def drop_totali_rows(df: pd.DataFrame, key_cols: List[str]) -> pd.DataFrame:
     return df.loc[~mask_tot].copy()
 
 
-def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]], fixed_year: Optional[int]) -> pd.DataFrame:
+def clean_and_prepare_vendite(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]], fixed_year: Optional[int]) -> pd.DataFrame:
     df = df_raw.copy()
 
     rename = {
@@ -175,12 +200,13 @@ def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]], fi
 
     missing = [c for c in keep if c not in df.columns]
     if missing:
-        raise KeyError(f"Mancano colonne dopo mapping: {missing}")
+        raise KeyError(f"Mancano colonne dopo mapping vendite: {missing}")
 
     df = df[keep].copy()
 
     for c in ["agente", "citta", "cliente", "categoria"]:
         df[c] = df[c].astype(str).str.strip()
+
     if "zona" in df.columns:
         df["zona"] = df["zona"].astype(str).str.strip()
     if "articolo" in df.columns:
@@ -196,8 +222,8 @@ def clean_and_prepare(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]], fi
     key_cols = ["agente", "citta", "cliente", "categoria"]
     if "articolo" in df.columns:
         key_cols.append("articolo")
-    df = drop_totali_rows(df, key_cols=key_cols)
 
+    df = drop_totali_rows(df, key_cols=key_cols)
     df = df[(df["agente"] != "") & (df["cliente"] != "")]
     return df
 
@@ -206,22 +232,82 @@ def filter_active_clients_2025(df: pd.DataFrame) -> pd.DataFrame:
     df_2025 = df[df["anno"] == 2025].copy()
     if df_2025.empty:
         return df.iloc[0:0].copy()
-
     active = df_2025.groupby("cliente", as_index=False)["fatturato"].sum()
     active = active[active["fatturato"] > 0]["cliente"].unique().tolist()
     return df[df["cliente"].isin(active)].copy()
 
 
 # ============================================================
+# CLEANING PROVVIGIONI
+# ============================================================
+def clean_and_prepare_provv(df_raw: pd.DataFrame, colmap: Dict[str, Optional[str]]) -> pd.DataFrame:
+    df = df_raw.copy()
+
+    rename = {}
+    for k, v in colmap.items():
+        if v:
+            rename[v] = k
+    df = df.rename(columns=rename)
+
+    # richieste minime
+    missing = [k for k in REQUIRED_PROVV if k not in df.columns]
+    if missing:
+        raise KeyError(f"Mancano colonne dopo mapping provvigioni: {missing}")
+
+    # normalizza campi base
+    df["cod_cliente"] = df["cod_cliente"].astype(str).str.strip()
+    df["provvigione"] = pd.to_numeric(df["provvigione"], errors="coerce").fillna(0.0).astype(float)
+
+    if "fatt_provv" in df.columns:
+        df["fatt_provv"] = pd.to_numeric(df["fatt_provv"], errors="coerce").fillna(0.0).astype(float)
+
+    for c in ["agente", "cliente_nome", "citta", "prov", "indirizzo", "cap", "cod_agente"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    # elimina righe senza cod_cliente
+    df = df[df["cod_cliente"].astype(str).str.strip() != ""].copy()
+    return df
+
+
+def aggregate_provv_by_cliente(df_provv: pd.DataFrame) -> pd.DataFrame:
+    """
+    Locale per locale = per cliente:
+      provv_locale = somma(importo provvigione) per cod_cliente
+      fatt_provv_locale = somma(fatturato per calcolo provvigioni) per cod_cliente (se presente)
+    """
+    if df_provv.empty:
+        return pd.DataFrame(columns=["cod_cliente", "provv_locale", "fatt_provv_locale"])
+
+    agg_dict = {"provvigione": "sum"}
+    if "fatt_provv" in df_provv.columns:
+        agg_dict["fatt_provv"] = "sum"
+
+    out = df_provv.groupby("cod_cliente", as_index=False).agg(agg_dict)
+    out = out.rename(columns={"provvigione": "provv_locale"})
+    if "fatt_provv" in out.columns:
+        out = out.rename(columns={"fatt_provv": "fatt_provv_locale"})
+    else:
+        out["fatt_provv_locale"] = 0.0
+    return out
+
+
+# ============================================================
 # REPORT
 # ============================================================
-def report_city_summary(df_anno: pd.DataFrame, include_agents: bool) -> pd.DataFrame:
+def report_city_summary(df_anno: pd.DataFrame, include_agents: bool, include_provv: bool) -> pd.DataFrame:
+    agg = {
+        "fatturato": ("fatturato", "sum"),
+        "n_clienti": ("cliente", "nunique"),
+    }
+    if include_provv and "provv_locale" in df_anno.columns:
+        agg["provvigioni"] = ("provv_locale", "sum")
+
     if include_agents:
         rep = (
             df_anno.groupby("citta")
             .agg(
-                fatturato=("fatturato", "sum"),
-                n_clienti=("cliente", "nunique"),
+                **agg,
                 agenti=("agente", lambda s: ", ".join(sorted(set(map(str, s.dropna()))))),
             )
             .reset_index()
@@ -230,13 +316,11 @@ def report_city_summary(df_anno: pd.DataFrame, include_agents: bool) -> pd.DataF
     else:
         rep = (
             df_anno.groupby("citta")
-            .agg(
-                fatturato=("fatturato", "sum"),
-                n_clienti=("cliente", "nunique"),
-            )
+            .agg(**agg)
             .reset_index()
             .sort_values("fatturato", ascending=False)
         )
+
     return rep
 
 
@@ -244,10 +328,13 @@ def report_fatturato_per_categoria(df_anno: pd.DataFrame) -> pd.DataFrame:
     return df_anno.groupby("categoria", as_index=False)["fatturato"].sum().sort_values("fatturato", ascending=False)
 
 
-def report_fatturato_per_agente_2025(df: pd.DataFrame) -> pd.DataFrame:
+def report_fatturato_per_agente_2025(df: pd.DataFrame, include_provv: bool) -> pd.DataFrame:
     df_2025 = df[df["anno"] == 2025].copy()
     if df_2025.empty:
-        return pd.DataFrame(columns=["agente", "fatturato", "clienti_attivi", "%_incidenza"])
+        cols = ["agente", "fatturato", "clienti_attivi", "%_incidenza"]
+        if include_provv:
+            cols.append("provvigioni")
+        return pd.DataFrame(columns=cols)
 
     fatt = df_2025.groupby("agente", as_index=False)["fatturato"].sum()
     clienti = df_2025.groupby("agente", as_index=False)["cliente"].nunique().rename(columns={"cliente": "clienti_attivi"})
@@ -255,15 +342,24 @@ def report_fatturato_per_agente_2025(df: pd.DataFrame) -> pd.DataFrame:
 
     total = out["fatturato"].sum()
     out["%_incidenza"] = (out["fatturato"] / total * 100.0) if total > 0 else 0.0
+
+    if include_provv and "provv_locale" in df_2025.columns:
+        provv = df_2025.groupby("agente", as_index=False)["provv_locale"].sum().rename(columns={"provv_locale": "provvigioni"})
+        out = out.merge(provv, on="agente", how="left")
+        out["provvigioni"] = out["provvigioni"].fillna(0.0)
+
     return out.sort_values("fatturato", ascending=False)
 
 
-def report_agente_citta_cliente(df_anno: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df_anno.groupby(["agente", "citta", "cliente"], as_index=False)["fatturato"]
-        .sum()
-        .sort_values(["agente", "citta", "fatturato"], ascending=[True, True, False])
-    )
+def report_agente_citta_cliente(df_anno: pd.DataFrame, include_provv: bool) -> pd.DataFrame:
+    gcols = ["agente", "citta", "cliente"]
+    agg = {"fatturato": "sum"}
+    if include_provv and "provv_locale" in df_anno.columns:
+        agg["provv_locale"] = "sum"
+
+    out = df_anno.groupby(gcols, as_index=False).agg(agg)
+    out = out.sort_values(["agente", "citta", "fatturato"], ascending=[True, True, False])
+    return out
 
 
 # ============================================================
@@ -272,9 +368,9 @@ def report_agente_citta_cliente(df_anno: pd.DataFrame) -> pd.DataFrame:
 def build_client_table_2025(df: pd.DataFrame) -> pd.DataFrame:
     df_2025 = df[df["anno"] == 2025].copy()
     if df_2025.empty:
-        return pd.DataFrame(columns=["agente", "citta", "cliente", "categoria", "fatt_2025"])
+        return pd.DataFrame(columns=["agente", "citta", "cliente", "fatt_2025", "client_code", "provv_locale", "fatt_provv_locale"])
 
-    cols = ["agente", "citta", "cliente", "categoria"]
+    cols = ["agente", "citta", "cliente"]
     if "zona" in df_2025.columns:
         cols.append("zona")
 
@@ -282,9 +378,34 @@ def build_client_table_2025(df: pd.DataFrame) -> pd.DataFrame:
         df_2025.groupby(cols, as_index=False)["fatturato"]
         .sum()
         .rename(columns={"fatturato": "fatt_2025"})
-        .sort_values("fatt_2025", ascending=True)
     )
-    return out
+
+    out["client_code"] = out["cliente"].apply(extract_client_code)
+
+    # se il df ha già provv_locale a riga vendite (dopo merge), sommiamo per cliente
+    if "provv_locale" in df_2025.columns:
+        provv = (
+            df_2025.groupby(["cliente"], as_index=False)["provv_locale"].sum()
+            .rename(columns={"provv_locale": "provv_locale_sum"})
+        )
+        out = out.merge(provv, on="cliente", how="left")
+        out["provv_locale"] = out["provv_locale_sum"].fillna(0.0)
+        out = out.drop(columns=["provv_locale_sum"])
+    else:
+        out["provv_locale"] = 0.0
+
+    if "fatt_provv_locale" in df_2025.columns:
+        fp = (
+            df_2025.groupby(["cliente"], as_index=False)["fatt_provv_locale"].sum()
+            .rename(columns={"fatt_provv_locale": "fatt_provv_locale_sum"})
+        )
+        out = out.merge(fp, on="cliente", how="left")
+        out["fatt_provv_locale"] = out["fatt_provv_locale_sum"].fillna(0.0)
+        out = out.drop(columns=["fatt_provv_locale_sum"])
+    else:
+        out["fatt_provv_locale"] = 0.0
+
+    return out.sort_values("fatt_2025", ascending=True)
 
 
 def apply_manual_overrides(df_clients: pd.DataFrame, overrides: Dict[str, str]) -> pd.DataFrame:
@@ -298,7 +419,7 @@ def apply_manual_overrides(df_clients: pd.DataFrame, overrides: Dict[str, str]) 
 
 def compute_agent_loads_from_clients(df_clients_2025: pd.DataFrame, dispersion_weight: float, all_agents: List[str]) -> pd.DataFrame:
     if df_clients_2025.empty:
-        base = pd.DataFrame(columns=["agente", "clienti", "citta_distinte", "fatturato", "load_score"])
+        base = pd.DataFrame(columns=["agente", "clienti", "citta_distinte", "fatturato", "provvigioni", "load_score"])
     else:
         base = (
             df_clients_2025.groupby("agente")
@@ -306,6 +427,7 @@ def compute_agent_loads_from_clients(df_clients_2025: pd.DataFrame, dispersion_w
                 clienti=("cliente", "nunique"),
                 citta_distinte=("citta", "nunique"),
                 fatturato=("fatt_2025", "sum"),
+                provvigioni=("provv_locale", "sum"),
             )
             .reset_index()
         )
@@ -321,6 +443,7 @@ def compute_agent_loads_from_clients(df_clients_2025: pd.DataFrame, dispersion_w
                 "clienti": [0] * len(missing),
                 "citta_distinte": [0] * len(missing),
                 "fatturato": [0.0] * len(missing),
+                "provvigioni": [0.0] * len(missing),
             }
         )
         add["load_score"] = add["clienti"] + dispersion_weight * add["citta_distinte"]
@@ -339,12 +462,9 @@ def simulate_reassignment(
     prefer_same_city: bool = True,
     max_moves: int = 10_000,
 ) -> Dict[str, pd.DataFrame]:
-    """
-    df_clients: tabella clienti 2025 (agente, citta, cliente, fatt_2025, ...)
-    """
     if df_clients.empty:
         return {
-            "moves": pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"]),
+            "moves": pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025", "provv_locale"]),
             "before": pd.DataFrame(),
             "after": pd.DataFrame(),
             "after_clients": pd.DataFrame(),
@@ -353,7 +473,6 @@ def simulate_reassignment(
 
     dfc = df_clients.copy()
 
-    # agenti base
     agent_clients = dfc.groupby("agente")["cliente"].apply(lambda x: set(x.tolist())).to_dict()
     agent_cities = dfc.groupby("agente")["citta"].apply(lambda x: set(x.tolist())).to_dict()
     agent_fatt_init = dfc.groupby("agente")["fatt_2025"].sum().to_dict()
@@ -370,12 +489,11 @@ def simulate_reassignment(
         agent_fatt.setdefault(a, 0.0)
 
     all_agents = sorted(agent_clients.keys())
-
-    # before loads
     before_loads = compute_agent_loads_from_clients(dfc, dispersion_weight, all_agents)
 
     current_city_of = dfc.set_index("cliente")["citta"].to_dict()
     current_fatt_of = dfc.set_index("cliente")["fatt_2025"].to_dict()
+    current_provv_of = dfc.set_index("cliente")["provv_locale"].to_dict()
 
     min_fatt_allowed = {a: agent_fatt_init.get(a, 0.0) * (1.0 - max_fatt_loss_pct) for a in all_agents}
 
@@ -397,7 +515,7 @@ def simulate_reassignment(
 
     if not overloaded:
         return {
-            "moves": pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"]),
+            "moves": pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025", "provv_locale"]),
             "before": before_loads,
             "after": before_loads,
             "after_clients": dfc.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False]),
@@ -431,6 +549,7 @@ def simulate_reassignment(
                 break
 
             fatt = float(current_fatt_of.get(client, 0.0))
+            provv = float(current_provv_of.get(client, 0.0))
             city = str(current_city_of.get(client, "") or "")
 
             # vincolo perdita fatturato
@@ -453,23 +572,27 @@ def simulate_reassignment(
             agent_cities[target] = set(current_city_of.get(c, "") for c in agent_clients.get(target, set()))
             city_agents = rebuild_city_agents()
 
-            moves.append({"cliente": client, "citta": city, "da_agente": donor, "a_agente": target, "fatt_2025": fatt})
+            moves.append({"cliente": client, "citta": city, "da_agente": donor, "a_agente": target, "fatt_2025": fatt, "provv_locale": provv})
             moves_count += 1
 
         if moves_count >= max_moves:
             break
 
-    moves_df = pd.DataFrame(moves) if moves else pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025"])
+    moves_df = pd.DataFrame(moves) if moves else pd.DataFrame(columns=["cliente", "citta", "da_agente", "a_agente", "fatt_2025", "provv_locale"])
 
-    # after clients
     rows = []
     for a, clset in agent_clients.items():
         for c in clset:
             rows.append(
-                {"agente": a, "citta": current_city_of.get(c, ""), "cliente": c, "fatt_2025": float(current_fatt_of.get(c, 0.0))}
+                {
+                    "agente": a,
+                    "citta": current_city_of.get(c, ""),
+                    "cliente": c,
+                    "fatt_2025": float(current_fatt_of.get(c, 0.0)),
+                    "provv_locale": float(current_provv_of.get(c, 0.0)),
+                }
             )
     after_clients = pd.DataFrame(rows)
-
     after_loads = compute_agent_loads_from_clients(after_clients, dispersion_weight, all_agents)
 
     note_msg = (
@@ -481,21 +604,18 @@ def simulate_reassignment(
         "moves": moves_df.sort_values("fatt_2025", ascending=True) if not moves_df.empty else moves_df,
         "before": before_loads,
         "after": after_loads,
-        "after_clients": after_clients.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False])
-        if not after_clients.empty
-        else after_clients,
+        "after_clients": after_clients.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False]) if not after_clients.empty else after_clients,
         "note": pd.DataFrame([{"msg": note_msg}]),
     }
 
 
 # ============================================================
-# UI - HEADER
+# SESSION STATE
 # ============================================================
 st.title("📊 Analisi vendite + 🧭 Ottimizzazione area")
 
-# agenti papabili solo in app (sessione)
 if "extra_agents" not in st.session_state:
-    st.session_state.extra_agents = []  # non persistente per tua richiesta
+    st.session_state.extra_agents = []  # non persistente (come richiesto)
 if "manual_overrides" not in st.session_state:
     st.session_state.manual_overrides = {}  # {cliente: nuovo_agente}
 if "manual_moves" not in st.session_state:
@@ -503,109 +623,225 @@ if "manual_moves" not in st.session_state:
 
 
 # ============================================================
-# SIDEBAR - FILE
+# SIDEBAR - FILES
 # ============================================================
 with st.sidebar:
-    st.header("Dati")
-    mode = st.radio("Sorgente file", ["Upload Excel", "Locale (statisticatot25.xlsx)"], index=0)
+    st.header("Dati vendite")
+    mode_v = st.radio("Sorgente vendite", ["Upload Excel", "Locale (statisticatot25.xlsx)"], index=0)
 
-    uploaded_bytes = None
-    file_path = str(DEFAULT_XLSX)
+    vend_bytes = None
+    vend_path = str(DEFAULT_VENDITE_XLSX)
 
-    if mode == "Upload Excel":
-        up = st.file_uploader("Carica statisticatot25.xlsx", type=["xlsx"])
+    if mode_v == "Upload Excel":
+        up = st.file_uploader("Carica statisticatot25.xlsx", type=["xlsx"], key="vend_up")
         if up is None:
-            st.info("Carica un file Excel per iniziare.")
+            st.info("Carica il file vendite per iniziare.")
             st.stop()
-        uploaded_bytes = up.getvalue()
+        vend_bytes = up.getvalue()
     else:
-        if not DEFAULT_XLSX.exists():
-            st.warning("Non trovo statisticatot25.xlsx accanto a app.py. Usa Upload Excel.")
+        if not DEFAULT_VENDITE_XLSX.exists():
+            st.warning("Non trovo statisticatot25.xlsx accanto a app.py. Usa Upload.")
             st.stop()
 
     st.divider()
-    st.header("Mapping colonne")
+    st.header("Dati provvigioni (opzionale)")
+    mode_p = st.radio("Sorgente provvigioni", ["Nessun file", "Upload provvigioni (.xls/.xlsx)", "Locale (Progetto_ponente_26.xls)"], index=0)
+
+    provv_bytes = None
+    provv_path = str(DEFAULT_PROVV_FILE)
+    provv_enabled = mode_p != "Nessun file"
+
+    if mode_p == "Upload provvigioni (.xls/.xlsx)":
+        up2 = st.file_uploader("Carica file provvigioni", type=["xls", "xlsx"], key="provv_up")
+        if up2 is not None:
+            provv_bytes = up2.getvalue()
+        else:
+            st.warning("Se vuoi usare le provvigioni, carica il file.")
+            provv_enabled = False
+    elif mode_p == "Locale (Progetto_ponente_26.xls)":
+        if not DEFAULT_PROVV_FILE.exists():
+            st.warning("Non trovo Progetto_ponente_26.xls accanto a app.py. Usa Upload.")
+            provv_enabled = False
+
+    st.divider()
+    st.header("Mapping colonne vendite")
 
 
-# LOAD RAW
+# ============================================================
+# LOAD VENDITE RAW
+# ============================================================
 try:
-    df_raw = load_excel_cached(uploaded_bytes, file_path)
+    df_raw_v = load_excel_cached(vend_bytes, vend_path)
 except Exception as e:
-    st.error(f"Errore lettura Excel: {e}")
+    st.error(f"Errore lettura vendite: {e}")
     st.stop()
 
-if df_raw is None or df_raw.empty:
-    st.error("Excel vuoto o non leggibile.")
+if df_raw_v is None or df_raw_v.empty:
+    st.error("File vendite vuoto o non leggibile.")
     st.stop()
 
-df_cols = list(df_raw.columns)
+vend_cols = list(df_raw_v.columns)
 
-guess = guess_column_map(df_raw)
-saved_map = safe_read_json(COLUMN_MAP_FILE, default={})
-colmap_pref = {**guess, **saved_map}
-saved_non_movable = safe_read_json(NON_MOVABLE_FILE, default=[])
+guess_v = guess_map(df_raw_v, VENDITE_SYNONYMS)
+saved_v = safe_read_json(COLUMN_MAP_VENDITE_FILE, default={})
+colmap_v_pref = {**guess_v, **saved_v}
 
 fixed_year = None
 
 with st.sidebar:
-    st.caption("Seleziona le colonne corrette. Le obbligatorie devono essere tutte diverse.")
+    st.caption("Seleziona le colonne corrette (vendite). Le obbligatorie devono essere diverse.")
 
-    def pick_col(label: str, keyname: str, optional: bool = False) -> Optional[str]:
-        current = colmap_pref.get(keyname)
-
+    def pick_col(label: str, keyname: str, options: List[str], current: Optional[str], optional: bool = False) -> Optional[str]:
         if optional:
-            options = ["(non impostata)"] + df_cols
-            idx = options.index(current) if current in options else 0
-            sel = st.selectbox(label, options=options, index=idx, key=f"map_{keyname}")
+            opts = ["(non impostata)"] + options
+            idx = opts.index(current) if current in opts else 0
+            sel = st.selectbox(label, options=opts, index=idx, key=f"map_v_{keyname}")
             return None if sel == "(non impostata)" else sel
 
         placeholder = "(seleziona...)"
-        options = [placeholder] + df_cols
-        idx = options.index(current) if current in options else 0
-        sel = st.selectbox(label, options=options, index=idx, key=f"map_{keyname}")
+        opts = [placeholder] + options
+        idx = opts.index(current) if current in opts else 0
+        sel = st.selectbox(label, options=opts, index=idx, key=f"map_v_{keyname}")
         return None if sel == placeholder else sel
 
-    colmap_ui: Dict[str, Optional[str]] = {}
-    colmap_ui["agente"] = pick_col("Colonna Agente", "agente")
-    colmap_ui["citta"] = pick_col("Colonna Città", "citta")
-    colmap_ui["cliente"] = pick_col("Colonna Cliente", "cliente")
-    colmap_ui["categoria"] = pick_col("Colonna Categoria", "categoria")
-    colmap_ui["fatturato"] = pick_col("Colonna Valore (es. acquistato 2025)", "fatturato")
-    colmap_ui["anno"] = pick_col("Colonna Anno (opzionale)", "anno", optional=True)
-    colmap_ui["articolo"] = pick_col("Colonna Articolo (opzionale)", "articolo", optional=True)
-    colmap_ui["zona"] = pick_col("Colonna Zona (opzionale)", "zona", optional=True)
+    colmap_v: Dict[str, Optional[str]] = {}
+    colmap_v["agente"] = pick_col("Colonna Agente", "agente", vend_cols, colmap_v_pref.get("agente"))
+    colmap_v["citta"] = pick_col("Colonna Città", "citta", vend_cols, colmap_v_pref.get("citta"))
+    colmap_v["cliente"] = pick_col("Colonna Cliente", "cliente", vend_cols, colmap_v_pref.get("cliente"))
+    colmap_v["categoria"] = pick_col("Colonna Categoria", "categoria", vend_cols, colmap_v_pref.get("categoria"))
+    colmap_v["fatturato"] = pick_col("Colonna Valore (es. acquistato 2025)", "fatturato", vend_cols, colmap_v_pref.get("fatturato"))
+    colmap_v["anno"] = pick_col("Colonna Anno (opzionale)", "anno", vend_cols, colmap_v_pref.get("anno"), optional=True)
+    colmap_v["articolo"] = pick_col("Colonna Articolo (opzionale)", "articolo", vend_cols, colmap_v_pref.get("articolo"), optional=True)
+    colmap_v["zona"] = pick_col("Colonna Zona (opzionale)", "zona", vend_cols, colmap_v_pref.get("zona"), optional=True)
 
-    ok, missing, has_dup = validate_map(colmap_ui)
+    ok, missing, has_dup = validate_map(colmap_v, REQUIRED_VENDITE)
     if not ok:
-        st.error(f"Mancano colonne: {', '.join(missing)}")
+        st.error(f"Mancano colonne vendite: {', '.join(missing)}")
         st.stop()
     if has_dup:
-        st.error("Hai assegnato la stessa colonna a più campi. Seleziona colonne diverse.")
+        st.error("Hai assegnato la stessa colonna vendite a più campi. Scegli colonne diverse.")
         st.stop()
 
-    if not colmap_ui.get("anno"):
-        fixed_year = infer_year_from_header(colmap_ui.get("fatturato") or "")
+    if not colmap_v.get("anno"):
+        fixed_year = infer_year_from_header(colmap_v.get("fatturato") or "")
         if fixed_year:
             st.info(f"Anno dedotto dal nome colonna valore: {fixed_year}")
         else:
             fixed_year = st.number_input("Anno fisso per la colonna valore", min_value=2000, max_value=2100, value=2025, step=1)
 
-    if st.button("💾 Salva mapping colonne"):
-        safe_write_json(COLUMN_MAP_FILE, colmap_ui)
-        st.success("Mapping salvato!")
+    if st.button("💾 Salva mapping vendite"):
+        safe_write_json(COLUMN_MAP_VENDITE_FILE, colmap_v)
+        st.success("Mapping vendite salvato!")
 
 
-# PREP DATA
+# ============================================================
+# PREP VENDITE
+# ============================================================
 try:
-    df = clean_and_prepare(df_raw, colmap_ui, fixed_year=fixed_year)
+    df_v = clean_and_prepare_vendite(df_raw_v, colmap_v, fixed_year=fixed_year)
 except Exception as e:
-    st.error(f"Errore preparazione dati: {e}")
+    st.error(f"Errore preparazione vendite: {e}")
     st.stop()
 
-df = filter_active_clients_2025(df)
-if df.empty:
-    st.warning("Nessun cliente con valore 2025 > 0 (oppure anno 2025 assente).")
+df_v = filter_active_clients_2025(df_v)
+if df_v.empty:
+    st.warning("Nessun cliente con fatturato 2025 > 0 (o anno 2025 assente).")
     st.stop()
+
+
+# ============================================================
+# LOAD + PREP PROVV (OPZIONALE)
+# ============================================================
+df_provv_raw = None
+df_provv = None
+provv_agg = None
+unmatched_codes_df = pd.DataFrame(columns=["client_code", "cliente", "citta", "agente"])
+
+if provv_enabled:
+    try:
+        df_provv_raw = load_excel_cached(provv_bytes, provv_path)
+    except Exception as e:
+        st.warning(
+            f"Non riesco a leggere il file provvigioni ({e}). "
+            "Se è .xls su Streamlit Cloud, aggiungi xlrd==2.0.1 in requirements, oppure converti in .xlsx."
+        )
+        provv_enabled = False
+
+if provv_enabled and df_provv_raw is not None and not df_provv_raw.empty:
+    provv_cols = list(df_provv_raw.columns)
+    guess_p = guess_map(df_provv_raw, PROVV_SYNONYMS)
+    saved_p = safe_read_json(COLUMN_MAP_PROVV_FILE, default={})
+    colmap_p_pref = {**guess_p, **saved_p}
+
+    with st.sidebar:
+        st.divider()
+        st.header("Mapping colonne provvigioni")
+        st.caption("Minimo richiesto: cod cliente + importo provvigione")
+
+        def pick_col_p(label: str, keyname: str, optional: bool = False) -> Optional[str]:
+            current = colmap_p_pref.get(keyname)
+            if optional:
+                opts = ["(non impostata)"] + provv_cols
+                idx = opts.index(current) if current in opts else 0
+                sel = st.selectbox(label, options=opts, index=idx, key=f"map_p_{keyname}")
+                return None if sel == "(non impostata)" else sel
+            placeholder = "(seleziona...)"
+            opts = [placeholder] + provv_cols
+            idx = opts.index(current) if current in opts else 0
+            sel = st.selectbox(label, options=opts, index=idx, key=f"map_p_{keyname}")
+            return None if sel == placeholder else sel
+
+        colmap_p: Dict[str, Optional[str]] = {}
+        colmap_p["cod_cliente"] = pick_col_p("Colonna Cod Cliente", "cod_cliente")
+        colmap_p["provvigione"] = pick_col_p("Colonna Importo Provvigione", "provvigione")
+        colmap_p["fatt_provv"] = pick_col_p("Colonna Fatturato per calcolo provvigioni (opz.)", "fatt_provv", optional=True)
+        colmap_p["agente"] = pick_col_p("Colonna Agente (opz.)", "agente", optional=True)
+        colmap_p["cod_agente"] = pick_col_p("Colonna Cod Agente (opz.)", "cod_agente", optional=True)
+        colmap_p["cliente_nome"] = pick_col_p("Colonna Nominativo cliente (opz.)", "cliente_nome", optional=True)
+        colmap_p["citta"] = pick_col_p("Colonna Città (opz.)", "citta", optional=True)
+        colmap_p["prov"] = pick_col_p("Colonna Provincia (opz.)", "prov", optional=True)
+        colmap_p["indirizzo"] = pick_col_p("Colonna Indirizzo (opz.)", "indirizzo", optional=True)
+        colmap_p["cap"] = pick_col_p("Colonna CAP (opz.)", "cap", optional=True)
+
+        okp, missp, dupp = validate_map(colmap_p, REQUIRED_PROVV)
+        if not okp:
+            st.error(f"Mancano colonne provvigioni: {', '.join(missp)}")
+            provv_enabled = False
+        if dupp:
+            st.error("Hai assegnato la stessa colonna provvigioni a più campi (nelle obbligatorie).")
+            provv_enabled = False
+
+        if st.button("💾 Salva mapping provvigioni"):
+            safe_write_json(COLUMN_MAP_PROVV_FILE, colmap_p)
+            st.success("Mapping provvigioni salvato!")
+
+    if provv_enabled:
+        try:
+            df_provv = clean_and_prepare_provv(df_provv_raw, colmap_p)
+            provv_agg = aggregate_provv_by_cliente(df_provv)
+        except Exception as e:
+            st.warning(f"Problema preparazione provvigioni: {e}")
+            provv_enabled = False
+
+# ============================================================
+# MERGE PROVV -> VENDITE (solo se disponibile)
+# ============================================================
+include_provv = provv_enabled and (provv_agg is not None) and (not provv_agg.empty)
+
+if include_provv:
+    # aggiungo cod cliente alle vendite
+    df_v = df_v.copy()
+    df_v["client_code"] = df_v["cliente"].apply(extract_client_code)
+
+    df_v = df_v.merge(provv_agg, left_on="client_code", right_on="cod_cliente", how="left")
+    df_v["provv_locale"] = df_v["provv_locale"].fillna(0.0)
+    df_v["fatt_provv_locale"] = df_v["fatt_provv_locale"].fillna(0.0)
+    df_v = df_v.drop(columns=["cod_cliente"], errors="ignore")
+
+    # unmatched per debug/controllo
+    unmatched = df_v[(df_v["client_code"].astype(str).str.strip() != "") & (df_v["provv_locale"] == 0.0)].copy()
+    # (attenzione: può essere 0 anche se match reale ma provv 0; qui è solo segnalazione)
+    unmatched_codes_df = unmatched[["client_code", "cliente", "citta", "agente"]].drop_duplicates().head(200)
 
 
 # ============================================================
@@ -615,17 +851,13 @@ with st.sidebar:
     st.divider()
     st.header("Filtri report")
 
-    anni = sorted([a for a in df["anno"].unique().tolist() if a != 0])
+    anni = sorted([a for a in df_v["anno"].unique().tolist() if a != 0])
     default_year = 2025 if 2025 in anni else (anni[-1] if anni else 2025)
-    year_sel = st.selectbox(
-        "Anno",
-        options=anni if anni else [2025],
-        index=(anni.index(default_year) if anni and default_year in anni else 0),
-    )
+    year_sel = st.selectbox("Anno", options=anni if anni else [2025], index=(anni.index(default_year) if anni and default_year in anni else 0))
 
-    agents_all_base = sorted(df["agente"].unique().tolist())
-    cities_all = sorted(df["citta"].unique().tolist())
-    cats_all = sorted(df["categoria"].unique().tolist())
+    agents_all_base = sorted(df_v["agente"].unique().tolist())
+    cities_all = sorted(df_v["citta"].unique().tolist())
+    cats_all = sorted(df_v["categoria"].unique().tolist())
 
     filt_agents = st.multiselect("Agenti", options=agents_all_base, default=[])
     filt_cities = st.multiselect("Città", options=cities_all, default=[])
@@ -643,7 +875,7 @@ def apply_filters(d: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-df_year = apply_filters(df)
+df_year = apply_filters(df_v)
 
 
 # ============================================================
@@ -660,15 +892,15 @@ with tab_report:
 
     st.markdown("### Città: fatturato + numero clienti")
     show_agents_in_city = st.checkbox("Mostra anche agenti per città (opzionale)", value=False)
-    rep_city = report_city_summary(df_year, include_agents=show_agents_in_city)
+    show_provv_in_city = st.checkbox("Mostra provvigioni per città (opzionale)", value=include_provv, disabled=not include_provv)
 
-    st.dataframe(
-        rep_city.style.format({"fatturato": "{:,.2f}"}),
-        use_container_width=True,
-        hide_index=True,
-    )
+    rep_city = report_city_summary(df_year, include_agents=show_agents_in_city, include_provv=show_provv_in_city)
+    fmt = {"fatturato": "{:,.2f}"}
+    if show_provv_in_city and "provvigioni" in rep_city.columns:
+        fmt["provvigioni"] = "{:,.2f}"
 
-    # grafico solo sul fatturato (più pulito)
+    st.dataframe(rep_city.style.format(fmt), use_container_width=True, hide_index=True)
+
     if not rep_city.empty:
         st.bar_chart(rep_city.set_index("citta")["fatturato"])
 
@@ -684,30 +916,34 @@ with tab_report:
 
     with c2:
         st.markdown("### Fatturato per agente (solo 2025 + clienti attivi + % incidenza)")
-        rep_agent_2025 = report_fatturato_per_agente_2025(df)
-        st.dataframe(
-            rep_agent_2025.style.format({"fatturato": "{:,.2f}", "%_incidenza": "{:.2f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
+        rep_agent_2025 = report_fatturato_per_agente_2025(df_v, include_provv=include_provv)
+        fmt2 = {"fatturato": "{:,.2f}", "%_incidenza": "{:.2f}"}
+        if include_provv and "provvigioni" in rep_agent_2025.columns:
+            fmt2["provvigioni"] = "{:,.2f}"
+        st.dataframe(rep_agent_2025.style.format(fmt2), use_container_width=True, hide_index=True)
 
     st.divider()
 
     st.markdown("### Fatturato per zona (agente → città → cliente)")
-    rep_zone = report_agente_citta_cliente(df_year)
-    st.dataframe(rep_zone, use_container_width=True, hide_index=True)
+    rep_zone = report_agente_citta_cliente(df_year, include_provv=include_provv)
+    fmt3 = {"fatturato": "{:,.2f}"}
+    if include_provv and "provv_locale" in rep_zone.columns:
+        fmt3["provv_locale"] = "{:,.2f}"
+    st.dataframe(rep_zone.style.format(fmt3), use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("### Export report (Excel)")
 
-    report_bytes = to_excel_bytes(
-        {
-            f"citta_{year_sel}": rep_city,
-            f"fatturato_categoria_{year_sel}": rep_cat,
-            "fatturato_agente_2025": rep_agent_2025,
-            f"agente_citta_cliente_{year_sel}": rep_zone,
-        }
-    )
+    sheets = {
+        f"citta_{year_sel}": rep_city,
+        f"fatturato_categoria_{year_sel}": rep_cat,
+        "fatturato_agente_2025": rep_agent_2025,
+        f"agente_citta_cliente_{year_sel}": rep_zone,
+    }
+    if include_provv:
+        sheets["unmatched_codes_preview"] = unmatched_codes_df
+
+    report_bytes = to_excel_bytes(sheets)
 
     st.download_button(
         "⬇️ Scarica Report Excel",
@@ -723,7 +959,7 @@ with tab_report:
 with tab_opt:
     st.subheader("Ottimizzazione area: automatica + manuale + agenti papabili (solo in app)")
 
-    df_clients_base = build_client_table_2025(df)
+    df_clients_base = build_client_table_2025(df_v)
     df_clients_current = apply_manual_overrides(df_clients_base, st.session_state.manual_overrides)
 
     agents_from_file = sorted(df_clients_base["agente"].unique().tolist()) if not df_clients_base.empty else []
@@ -733,8 +969,8 @@ with tab_opt:
     # -------------------------
     # AGENTI PAPABILI
     # -------------------------
-    st.markdown("### 👤 Agenti papabili (li aggiungi e li usi come destinazione)")
-    colA, colB, colC = st.columns([1.3, 0.8, 1.5])
+    st.markdown("### 👤 Agenti papabili (solo in app)")
+    colA, colB, colC = st.columns([1.2, 0.8, 1.5])
     with colA:
         new_agent_name = st.text_input("Nome nuovo agente", value="", placeholder="Es. Nuovo Agente 1")
     with colB:
@@ -756,7 +992,6 @@ with tab_opt:
             if st.button("🗑️ Rimuovi"):
                 if to_remove != "(nessuno)":
                     st.session_state.extra_agents = [a for a in st.session_state.extra_agents if a != to_remove]
-                    # rimuove eventuali override che puntavano a quell'agente
                     if st.session_state.manual_overrides:
                         st.session_state.manual_overrides = {k: v for k, v in st.session_state.manual_overrides.items() if v != to_remove}
                     st.success(f"Rimosso: {to_remove}")
@@ -781,7 +1016,8 @@ with tab_opt:
 
             st.markdown("#### Clienti NON spostabili")
             all_clients = sorted(df_clients_base["cliente"].unique().tolist()) if not df_clients_base.empty else []
-            default_nonmov = [c for c in saved_non_movable if c in all_clients]
+            saved_nonmov = safe_read_json(NON_MOVABLE_FILE, default=[])
+            default_nonmov = [c for c in saved_nonmov if c in all_clients]
             non_movable_sel = st.multiselect("Lista non spostabili (persistente)", options=all_clients, default=default_nonmov)
 
             cbtn1, cbtn2 = st.columns(2)
@@ -799,10 +1035,10 @@ with tab_opt:
             lock_manual = st.checkbox("Non toccare i clienti spostati a mano (consigliato)", value=True)
 
         with right:
-            st.markdown("#### Carichi attuali (2025) - includendo agenti papabili")
+            st.markdown("#### Carichi attuali (prima) - includendo provvigioni")
             loads0 = compute_agent_loads_from_clients(df_clients_current, dispersion_weight, all_agents)
             st.dataframe(
-                loads0.style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}),
+                loads0.style.format({"fatturato": "{:,.2f}", "provvigioni": "{:,.2f}", "load_score": "{:,.2f}"}),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -830,15 +1066,15 @@ with tab_opt:
             st.info(sim["note"].iloc[0]["msg"] if not sim["note"].empty else "OK")
 
             st.markdown("### Spostamenti suggeriti (clienti piccoli prima)")
-            st.dataframe(sim["moves"].style.format({"fatt_2025": "{:,.2f}"}), use_container_width=True, hide_index=True)
+            st.dataframe(sim["moves"].style.format({"fatt_2025": "{:,.2f}", "provv_locale": "{:,.2f}"}), use_container_width=True, hide_index=True)
 
             cA, cB = st.columns(2)
             with cA:
                 st.markdown("### Prima")
-                st.dataframe(sim["before"].style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}), use_container_width=True, hide_index=True)
+                st.dataframe(sim["before"].style.format({"fatturato": "{:,.2f}", "provvigioni": "{:,.2f}", "load_score": "{:,.2f}"}), use_container_width=True, hide_index=True)
             with cB:
                 st.markdown("### Dopo")
-                st.dataframe(sim["after"].style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}), use_container_width=True, hide_index=True)
+                st.dataframe(sim["after"].style.format({"fatturato": "{:,.2f}", "provvigioni": "{:,.2f}", "load_score": "{:,.2f}"}), use_container_width=True, hide_index=True)
 
             st.markdown("### Export simulazione automatica (Excel)")
             sim_bytes = to_excel_bytes(
@@ -858,7 +1094,11 @@ with tab_opt:
 
         st.divider()
         st.markdown("#### Base clienti 2025 (dopo eventuali spostamenti manuali)")
-        st.dataframe(df_clients_current.sort_values("fatt_2025", ascending=False), use_container_width=True, hide_index=True)
+        st.dataframe(
+            df_clients_current.sort_values("fatt_2025", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     # ---------- MANUALE ----------
     with sub_manual:
@@ -875,6 +1115,7 @@ with tab_opt:
             max_fatt_loss_pct_m = st.slider("Max perdita fatturato donatore (manuale)", min_value=0, max_value=50, value=15, step=1) / 100.0
 
         ignore_fatt_vincolo = st.checkbox("Ignora vincolo fatturato donatore (manuale)", value=False)
+        ignore_dispersion = st.checkbox("Ignora dispersione (manuale) (usa solo clienti)", value=False)
         ignore_non_spostabili = st.checkbox("Ignora lista NON spostabili (manuale)", value=False)
 
         non_spostabili = safe_read_json(NON_MOVABLE_FILE, default=[])
@@ -888,7 +1129,7 @@ with tab_opt:
             df_city = df_clients_current[df_clients_current["citta"] == city_sel].copy()
             src_agent_options = sorted(df_city["agente"].dropna().unique().tolist())
             if not src_agent_options:
-                st.warning("In questa città non ci sono clienti assegnati a nessun agente.")
+                st.warning("In questa città non ci sono clienti assegnati.")
                 st.stop()
 
             src_agent = st.selectbox("Agente (sorgente)", options=src_agent_options)
@@ -901,8 +1142,12 @@ with tab_opt:
             else:
                 df_src_view = df_src
 
-            st.caption("Locali dell’agente in questa città (2025)")
-            st.dataframe(df_src_view[["cliente", "fatt_2025"]], use_container_width=True, hide_index=True)
+            st.caption("Locali dell’agente in questa città (2025) - con provvigioni")
+            st.dataframe(
+                df_src_view[["cliente", "fatt_2025", "provv_locale"]].style.format({"fatt_2025": "{:,.2f}", "provv_locale": "{:,.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
             clients_src = df_src_view["cliente"].tolist()
             sel_clients = st.multiselect("Seleziona locale/i da spostare", options=clients_src)
@@ -911,9 +1156,9 @@ with tab_opt:
             only_same_city = st.checkbox("Destinazione solo agenti della stessa città", value=True)
 
             agents_in_city = sorted(df_city["agente"].dropna().unique().tolist())
+
             if st.session_state.extra_agents:
-                # opzionale: includo papabili anche se non presenti in città (non fa casino)
-                include_papabili = st.checkbox("Includi agenti papabili anche se non presenti in città", value=True)
+                include_papabili = st.checkbox("Includi agenti papabili", value=True)
                 if include_papabili:
                     for a in st.session_state.extra_agents:
                         if a not in agents_in_city:
@@ -928,17 +1173,17 @@ with tab_opt:
             tgt_options = sorted(list(dict.fromkeys(tgt_options)))
             tgt_agent = st.selectbox("Agente (destinazione)", options=tgt_options if tgt_options else ["(nessuno)"])
 
-            st.markdown("### Carichi attuali (prima) - includendo papabili")
-            loads_before = compute_agent_loads_from_clients(df_clients_current, dispersion_weight_m, all_agents)
+            st.markdown("### Carichi attuali (prima) - includendo provvigioni")
+            dw = 0.0 if ignore_dispersion else dispersion_weight_m
+            loads_before = compute_agent_loads_from_clients(df_clients_current, dw, all_agents)
             st.dataframe(
-                loads_before.style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}),
+                loads_before.style.format({"fatturato": "{:,.2f}", "provvigioni": "{:,.2f}", "load_score": "{:,.2f}"}),
                 use_container_width=True,
                 hide_index=True,
             )
 
         st.divider()
 
-        # sposta tutti (rispetta ricerca)
         move_all = st.button("🚚 Sposta TUTTI i locali dell’agente sorgente (rispetta ricerca)", disabled=(tgt_agent == "(nessuno)"))
         if move_all:
             sel_clients = df_src_view["cliente"].tolist()
@@ -947,9 +1192,12 @@ with tab_opt:
 
         if do_move:
             fatt_by_agent = df_clients_current.groupby("agente")["fatt_2025"].sum().to_dict()
+            provv_by_agent = df_clients_current.groupby("agente")["provv_locale"].sum().to_dict()
+
             min_allowed = {a: fatt_by_agent.get(a, 0.0) * (1.0 - max_fatt_loss_pct_m) for a in all_agents}
 
             fatt_lookup = df_clients_current.set_index("cliente")["fatt_2025"].to_dict()
+            provv_lookup = df_clients_current.set_index("cliente")["provv_locale"].to_dict()
             city_lookup = df_clients_current.set_index("cliente")["citta"].to_dict()
             agent_lookup = df_clients_current.set_index("cliente")["agente"].to_dict()
 
@@ -963,13 +1211,24 @@ with tab_opt:
 
                 current_agent = agent_lookup.get(cl, src_agent)
                 fatt = float(fatt_lookup.get(cl, 0.0))
+                provv = float(provv_lookup.get(cl, 0.0))
 
                 if not ignore_fatt_vincolo:
                     if (fatt_by_agent.get(current_agent, 0.0) - fatt) < min_allowed.get(current_agent, 0.0):
                         blocked.append((cl, "vincolo fatturato donatore"))
                         continue
 
-                # override
+                # snapshot prima/dopo per i due agenti coinvolti
+                donor_f_before = fatt_by_agent.get(current_agent, 0.0)
+                donor_p_before = provv_by_agent.get(current_agent, 0.0)
+                dest_f_before = fatt_by_agent.get(tgt_agent, 0.0)
+                dest_p_before = provv_by_agent.get(tgt_agent, 0.0)
+
+                donor_f_after = donor_f_before - fatt
+                donor_p_after = donor_p_before - provv
+                dest_f_after = dest_f_before + fatt
+                dest_p_after = dest_p_before + provv
+
                 st.session_state.manual_overrides[cl] = tgt_agent
                 st.session_state.manual_moves.append(
                     {
@@ -979,12 +1238,23 @@ with tab_opt:
                         "da_agente": current_agent,
                         "a_agente": tgt_agent,
                         "fatt_2025": fatt,
+                        "provv_locale": provv,
+                        "donatore_fatt_prima": donor_f_before,
+                        "donatore_fatt_dopo": donor_f_after,
+                        "donatore_provv_prima": donor_p_before,
+                        "donatore_provv_dopo": donor_p_after,
+                        "dest_fatt_prima": dest_f_before,
+                        "dest_fatt_dopo": dest_f_after,
+                        "dest_provv_prima": dest_p_before,
+                        "dest_provv_dopo": dest_p_after,
                     }
                 )
 
-                # aggiorna contatori per gli step successivi nello stesso click
-                fatt_by_agent[current_agent] = fatt_by_agent.get(current_agent, 0.0) - fatt
-                fatt_by_agent[tgt_agent] = fatt_by_agent.get(tgt_agent, 0.0) + fatt
+                # aggiorna contatori locali per vincoli successivi nello stesso click
+                fatt_by_agent[current_agent] = donor_f_after
+                provv_by_agent[current_agent] = donor_p_after
+                fatt_by_agent[tgt_agent] = dest_f_after
+                provv_by_agent[tgt_agent] = dest_p_after
 
                 moved += 1
 
@@ -996,7 +1266,6 @@ with tab_opt:
 
             st.rerun()
 
-        # Stato e export manuale
         st.divider()
 
         moves_df = pd.DataFrame(st.session_state.manual_moves)
@@ -1005,33 +1274,47 @@ with tab_opt:
         agents_from_overrides_now = sorted(list(set(st.session_state.manual_overrides.values()))) if st.session_state.manual_overrides else []
         all_agents_now = sorted(list(set(agents_from_file + st.session_state.extra_agents + agents_from_overrides_now)))
 
-        loads_after = compute_agent_loads_from_clients(df_after_manual, dispersion_weight_m, all_agents_now)
+        dw2 = 0.0 if ignore_dispersion else dispersion_weight_m
+        loads_after = compute_agent_loads_from_clients(df_after_manual, dw2, all_agents_now)
 
         cA, cB = st.columns([1, 1])
         with cA:
-            st.markdown("### Movimenti manuali registrati")
+            st.markdown("### Movimenti manuali registrati (con provvigioni prima/dopo)")
             if moves_df.empty:
                 st.info("Nessun movimento manuale ancora.")
             else:
-                st.dataframe(moves_df.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
+                st.dataframe(
+                    moves_df.sort_values("timestamp", ascending=False).style.format(
+                        {
+                            "fatt_2025": "{:,.2f}",
+                            "provv_locale": "{:,.2f}",
+                            "donatore_provv_prima": "{:,.2f}",
+                            "donatore_provv_dopo": "{:,.2f}",
+                            "dest_provv_prima": "{:,.2f}",
+                            "dest_provv_dopo": "{:,.2f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         with cB:
-            st.markdown("### Carichi dopo movimenti manuali")
+            st.markdown("### Carichi dopo movimenti manuali (includendo provvigioni)")
             st.dataframe(
-                loads_after.style.format({"fatturato": "{:,.2f}", "load_score": "{:,.2f}"}),
+                loads_after.style.format({"fatturato": "{:,.2f}", "provvigioni": "{:,.2f}", "load_score": "{:,.2f}"}),
                 use_container_width=True,
                 hide_index=True,
             )
 
-        st.markdown("### Export manuale (Excel)")
+        st.markdown("### Export manuale (Excel) - unico file")
         export_bytes = to_excel_bytes(
             {
-                "movimenti_manuali": moves_df
-                if not moves_df.empty
-                else pd.DataFrame(columns=["timestamp", "citta", "cliente", "da_agente", "a_agente", "fatt_2025"]),
-                "clienti_dopo_manuale": df_after_manual.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False])
-                if not df_after_manual.empty
-                else df_after_manual,
+                "movimenti_manuali": moves_df if not moves_df.empty else pd.DataFrame(columns=[
+                    "timestamp","citta","cliente","da_agente","a_agente","fatt_2025","provv_locale",
+                    "donatore_fatt_prima","donatore_fatt_dopo","donatore_provv_prima","donatore_provv_dopo",
+                    "dest_fatt_prima","dest_fatt_dopo","dest_provv_prima","dest_provv_dopo"
+                ]),
+                "clienti_dopo_manuale": df_after_manual.sort_values(["agente", "citta", "fatt_2025"], ascending=[True, True, False]) if not df_after_manual.empty else df_after_manual,
                 "carichi_prima": loads_before,
                 "carichi_dopo": loads_after,
                 "agenti_papabili": pd.DataFrame({"agente_papabile": st.session_state.extra_agents}),
@@ -1058,5 +1341,9 @@ with tab_opt:
 # =========================
 with tab_data:
     st.subheader("Anteprima dati puliti (Totali esclusi + solo clienti 2025>0)")
-    st.write(f"Righe: {len(df):,}")
-    st.dataframe(df.head(300), use_container_width=True, hide_index=True)
+    st.write(f"Righe vendite: {len(df_v):,} | Provvigioni attive: {'Sì' if include_provv else 'No'}")
+    st.dataframe(df_v.head(300), use_container_width=True, hide_index=True)
+
+    if include_provv:
+        st.markdown("### Preview codici senza match provvigioni (campione)")
+        st.dataframe(unmatched_codes_df, use_container_width=True, hide_index=True)
